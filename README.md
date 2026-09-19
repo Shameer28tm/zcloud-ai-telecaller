@@ -4,17 +4,23 @@ Z Cloud AI Telecaller is a real-time conversational AI telecalling platform buil
 
 ## Phase 1 Architecture & Voice Pipeline
 
-The foundation establishes a WebRTC audio streaming pipeline connecting browser clients with LiveKit and autonomous AI agent workers:
+The Phase 1 foundation establishes a low-latency WebRTC audio streaming pipeline connecting browser clients with LiveKit and autonomous AI agent workers running at **₹0 API cost for STT and TTS**:
 
-```
+```text
 Browser / WebRTC  <--->  LiveKit Server  <--->  AI Agent Worker
                                                    |
                      +-----------------------------+-----------------------------+
                      |                             |                             |
                      v                             v                             v
-           Silero VAD / Whisper STT          Gemini 2.5 Flash               OpenAI TTS (Alloy)
-          (Speech-to-Text & VAD)        (Language Intelligence)            (Text-to-Speech)
+           Silero VAD / Faster-Whisper       Gemini 2.5 Flash               Piper Neural TTS
+           (Speech-to-Text & VAD, ₹0)     (Language Intelligence)          (Text-to-Speech, ₹0)
 ```
+
+- **VAD**: Silero VAD (`livekit-plugins-silero`)
+- **STT**: Local `faster-whisper` (CTranslate2) wrapped with LiveKit `StreamAdapter`
+- **LLM**: Google Gemini 2.5 Flash (`livekit-plugins-google`)
+- **TTS**: Local `piper-tts` neural voice synthesis
+- **Transport**: LiveKit WebRTC audio streaming
 
 ## Project Structure
 
@@ -32,10 +38,12 @@ zcloud-ai-telecaller/
 │       ├── __init__.py          # Package root exports
 │       ├── agent.py             # LiveKit Agent entry point and voice pipeline configuration
 │       ├── config.py            # Pydantic Settings configuration management
+│       ├── local_stt.py         # Local faster-whisper STT implementation (LiveKit STT)
+│       ├── local_tts.py         # Local Piper TTS implementation (LiveKit TTS)
 │       └── logging_config.py    # Structured logging configuration
 └── tests/
     ├── __init__.py
-    ├── test_agent.py            # Agent and AgentSession pipeline tests
+    ├── test_agent.py            # Agent, local STT/TTS pipeline, and lifecycle tests
     ├── test_config.py           # Configuration and environment tests
     └── test_logging.py          # Logging setup tests
 ```
@@ -48,7 +56,7 @@ zcloud-ai-telecaller/
 - [uv](https://docs.astral.sh/uv/) package manager
 - LiveKit Cloud account (or self-hosted LiveKit Server)
 - Google Gemini API Key (for LLM reasoning & responses)
-- OpenAI API Key (temporarily retained for Whisper STT and OpenAI TTS)
+- **Zero OpenAI API Key required** (STT and TTS run locally at ₹0 cost)
 
 ### 1. Install Dependencies
 
@@ -77,8 +85,13 @@ LIVEKIT_API_SECRET=secxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 # Google Gemini API Key (for LLM reasoning & response generation)
 GEMINI_API_KEY=AIzaSyxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
-# OpenAI API Key (temporarily retained for Whisper STT and OpenAI TTS Alloy)
-OPENAI_API_KEY=sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# Local STT Settings (faster-whisper, ₹0 API cost)
+WHISPER_MODEL_SIZE=base
+WHISPER_DEVICE=cpu
+WHISPER_COMPUTE_TYPE=int8
+
+# Local TTS Settings (Piper, ₹0 API cost)
+PIPER_VOICE=en_US-lessac-medium
 
 # Agent Worker Configuration
 AGENT_NAME=zcloud-ai-telecaller-agent
@@ -90,7 +103,7 @@ AGENT_LOG_LEVEL=INFO
 Start the agent worker locally in development mode:
 
 ```bash
-# Run in dev mode (hot reload enabled)
+# Run in dev mode
 uv run python -m zcloud_ai_telecaller.agent dev
 ```
 
@@ -104,8 +117,10 @@ Upon startup, the worker validates environment variables, pre-warms the Silero V
 ```text
 INFO | zcloud_ai_telecaller - Worker startup: Initializing Z Cloud AI Telecaller agent worker (agent=zcloud-ai-telecaller-agent)
 INFO | zcloud_ai_telecaller - Environment configuration validated successfully
-INFO | livekit.agents - registering worker...
-INFO | livekit.agents - worker registered and listening for jobs
+INFO | livekit.agents - starting worker
+INFO | livekit.agents - plugin registered {"plugin": "livekit.plugins.google", "version": "1.8.2"}
+INFO | livekit.agents - plugin registered {"plugin": "livekit.plugins.silero", "version": "1.8.2"}
+INFO | livekit.agents - registered worker {"agent_name": "zcloud-ai-telecaller-agent", "url": "wss://..."}
 ```
 
 ### 4. Connect a Browser Participant to LiveKit
@@ -134,13 +149,12 @@ When the browser participant connects:
    INFO | zcloud_ai_telecaller - Participant joined: identity=browser-user in room: telecaller-demo
    INFO | zcloud_ai_telecaller - Voice session started for room: telecaller-demo
    ```
-2. **Initial Greeting**: The agent speaks back over WebRTC:
+2. **Initial Greeting**: The agent speaks back over WebRTC via local Piper TTS:
    > *"Hello! I am your Z Cloud AI Voice Assistant. How can I help you today?"*
 3. **Speak into microphone**: Say a test phrase, for example:
    > *"Hi, can you introduce yourself?"*
-4. **Agent Response**: The agent will transcribe your speech via OpenAI Whisper, process it via Google Gemini 2.5 Flash adhering to the Phase 1 instructions, synthesize speech with OpenAI TTS, and respond over audio:
+4. **Agent Response**: The agent will transcribe your speech via local `faster-whisper`, process it via Google Gemini 2.5 Flash adhering to the Phase 1 instructions, synthesize speech with local `Piper`, and respond over audio:
    > *"I am Z Cloud AI Voice Assistant. I am friendly, concise and professional. This is only a Phase 1 technical demo."*
-
 
 ### Running Tests
 
@@ -150,17 +164,16 @@ Execute the automated test suite using `pytest`:
 uv run pytest -v
 ```
 
-All 8 tests verify configuration defaults, environment variable loading, strict validation of required keys, agent instructions, Silero VAD prewarming, and logging levels.
+All 11 tests verify configuration defaults, environment variable loading, strict validation of required keys, local STT & TTS capabilities, agent instructions, Silero VAD prewarming, and logging levels.
 
 ### Docker (Optional for Production)
 
 Docker is **not** required for local development. For production deployments or containerized runs:
 
 ```bash
-# Build the Docker container (pre-caches Silero VAD model assets)
+# Build the Docker container
 docker build -t zcloud-ai-telecaller .
 
 # Run container with environment configuration
 docker run --rm --env-file .env zcloud-ai-telecaller
 ```
-

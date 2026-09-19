@@ -1,7 +1,7 @@
 """LiveKit AI Voice Agent entry point for Z Cloud AI Telecaller.
 
 Voice Pipeline:
-Browser/WebRTC -> LiveKit Room -> Silero VAD / OpenAI STT -> OpenAI LLM -> OpenAI TTS -> LiveKit Room -> Browser
+Browser/WebRTC -> LiveKit Room -> Silero VAD / local faster-whisper STT -> Gemini 2.5 Flash LLM -> local Piper TTS -> LiveKit Room -> Browser
 """
 
 import asyncio
@@ -18,10 +18,13 @@ from livekit.agents import (
     JobProcess,
     WorkerOptions,
     cli,
+    stt,
 )
-from livekit.plugins import google, openai, silero
+from livekit.plugins import google, silero
 
 from zcloud_ai_telecaller.config import Settings, get_settings
+from zcloud_ai_telecaller.local_stt import FasterWhisperSTT
+from zcloud_ai_telecaller.local_tts import PiperTTS
 from zcloud_ai_telecaller.logging_config import setup_logging
 
 AGENT_INSTRUCTIONS = (
@@ -44,13 +47,14 @@ def create_agent(instructions: str = AGENT_INSTRUCTIONS) -> Agent:
 def create_agent_session(
     vad: Optional[silero.VAD] = None,
     gemini_api_key: Optional[str] = None,
-    openai_api_key: Optional[str] = None,
+    whisper_model_size: str = "base",
+    whisper_device: str = "cpu",
+    whisper_compute_type: str = "int8",
+    piper_voice: str = "en_US-lessac-medium",
+    piper_model_path: Optional[str] = None,
+    piper_config_path: Optional[str] = None,
 ) -> AgentSession:
-    """Creates and configures the AgentSession with Silero VAD, OpenAI STT, Google Gemini LLM, and OpenAI TTS."""
-    # Ensure OPENAI_API_KEY is available to STT and TTS plugins
-    if openai_api_key:
-        os.environ["OPENAI_API_KEY"] = openai_api_key
-
+    """Creates and configures the AgentSession with Silero VAD, local faster-whisper STT, Google Gemini LLM, and local Piper TTS."""
     # Resolve Gemini API key for Google LLM
     effective_gemini_key = (
         gemini_api_key
@@ -60,14 +64,31 @@ def create_agent_session(
     if effective_gemini_key:
         os.environ["GOOGLE_API_KEY"] = effective_gemini_key
 
+    vad_instance = vad or silero.VAD.load()
+
+    # Local STT using faster-whisper adapted for streaming audio
+    local_whisper = FasterWhisperSTT(
+        model_size_or_path=whisper_model_size,
+        device=whisper_device,
+        compute_type=whisper_compute_type,
+    )
+    stt_stream = stt.StreamAdapter(stt=local_whisper, vad=vad_instance)
+
+    # Local TTS using Piper neural voice
+    local_piper = PiperTTS(
+        voice_name=piper_voice,
+        model_path=piper_model_path,
+        config_path=piper_config_path,
+    )
+
     return AgentSession(
-        vad=vad or silero.VAD.load(),
-        stt=openai.STT(model="whisper-1"),
+        vad=vad_instance,
+        stt=stt_stream,
         llm=google.LLM(
             model="gemini-2.5-flash",
             api_key=effective_gemini_key or "dummy-key-for-initialization",
         ),
-        tts=openai.TTS(model="tts-1", voice="alloy"),
+        tts=local_piper,
     )
 
 
@@ -117,7 +138,12 @@ async def entrypoint(ctx: JobContext) -> None:
         session = create_agent_session(
             vad=vad,
             gemini_api_key=settings.gemini_api_key,
-            openai_api_key=settings.openai_api_key,
+            whisper_model_size=settings.whisper_model_size,
+            whisper_device=settings.whisper_device,
+            whisper_compute_type=settings.whisper_compute_type,
+            piper_voice=settings.piper_voice,
+            piper_model_path=settings.piper_model_path,
+            piper_config_path=settings.piper_config_path,
         )
         agent = create_agent()
     except Exception as exc:
@@ -176,8 +202,6 @@ def main() -> None:
     if settings.gemini_api_key:
         os.environ["GEMINI_API_KEY"] = settings.gemini_api_key
         os.environ["GOOGLE_API_KEY"] = settings.gemini_api_key
-    if settings.openai_api_key:
-        os.environ["OPENAI_API_KEY"] = settings.openai_api_key
 
     cli.run_app(
         WorkerOptions(

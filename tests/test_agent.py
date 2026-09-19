@@ -1,6 +1,9 @@
-"""Tests for LiveKit agent initialization and structure."""
+"""Tests for LiveKit agent initialization, local STT/TTS pipeline, and lifecycle."""
 
 import pytest
+from livekit.agents import stt
+from livekit.plugins import google
+
 from zcloud_ai_telecaller.agent import (
     AGENT_INSTRUCTIONS,
     GREETING_MESSAGE,
@@ -8,6 +11,8 @@ from zcloud_ai_telecaller.agent import (
     create_agent_session,
     prewarm,
 )
+from zcloud_ai_telecaller.local_stt import FasterWhisperSTT
+from zcloud_ai_telecaller.local_tts import PiperTTS
 
 
 def test_create_agent():
@@ -25,9 +30,7 @@ def test_create_agent():
 
 @pytest.mark.asyncio
 async def test_create_agent_session():
-    """Verify that create_agent_session initializes the voice pipeline with Google Gemini LLM."""
-    from livekit.plugins import google, openai
-
+    """Verify that create_agent_session initializes the voice pipeline with local STT/TTS and Google Gemini LLM."""
     session = create_agent_session(gemini_api_key="test-gemini-key")
     assert session is not None
     assert session.vad is not None
@@ -35,13 +38,37 @@ async def test_create_agent_session():
     assert session.llm is not None
     assert session.tts is not None
 
-    # Ensure Gemini LLM is configured
+    # Verify local STT is StreamAdapter wrapping FasterWhisperSTT
+    assert isinstance(session.stt, stt.StreamAdapter)
+    assert isinstance(session.stt.wrapped_stt, FasterWhisperSTT)
+    assert session.stt.capabilities.streaming is True
+
+    # Verify Gemini LLM is configured
     assert isinstance(session.llm, google.LLM)
     assert session.llm.model == "gemini-2.5-flash"
 
-    # Ensure OpenAI LLM is NOT instantiated in the session
-    assert not isinstance(session.llm, openai.LLM)
+    # Verify local TTS is PiperTTS
+    assert isinstance(session.tts, PiperTTS)
+    assert session.tts.model.startswith("piper-")
+    assert session.tts.sample_rate == 22050
 
+
+def test_local_stt_capabilities():
+    """Verify FasterWhisperSTT initialization and capabilities."""
+    local_stt = FasterWhisperSTT(model_size_or_path="base", device="cpu", compute_type="int8")
+    assert local_stt.model == "faster-whisper-base"
+    assert local_stt.provider == "faster-whisper"
+    assert local_stt.capabilities.streaming is False
+    assert local_stt.capabilities.interim_results is False
+
+
+def test_local_tts_capabilities():
+    """Verify PiperTTS initialization and capabilities."""
+    local_tts = PiperTTS(voice_name="en_US-lessac-medium")
+    assert local_tts.model == "piper-en_US-lessac-medium"
+    assert local_tts.provider == "piper"
+    assert local_tts.capabilities.streaming is False
+    assert local_tts.sample_rate == 22050
 
 
 def test_prewarm():
@@ -110,5 +137,3 @@ async def test_entrypoint_lifecycle(monkeypatch):
 
     # 5. Verify invoking shutdown callback produces an awaitable coroutine
     await shutdown_cb()
-
-

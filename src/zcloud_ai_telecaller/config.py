@@ -38,11 +38,38 @@ class Settings(BaseSettings):
         description="Google Gemini API Key for LLM plugin",
     )
 
-    # OpenAI API key (retained for STT and TTS plugins)
-    openai_api_key: Optional[str] = Field(
+    # Local STT (faster-whisper) settings
+    whisper_model_size: str = Field(
+        default="base",
+        validation_alias="WHISPER_MODEL_SIZE",
+        description="Whisper model size (e.g. tiny, base, small, medium, large-v3)",
+    )
+    whisper_device: str = Field(
+        default="cpu",
+        validation_alias="WHISPER_DEVICE",
+        description="Whisper compute device ('cpu', 'cuda', 'auto')",
+    )
+    whisper_compute_type: str = Field(
+        default="int8",
+        validation_alias="WHISPER_COMPUTE_TYPE",
+        description="Whisper quantization/compute type (e.g. 'int8', 'float16', 'default')",
+    )
+
+    # Local TTS (Piper) settings
+    piper_voice: str = Field(
+        default="en_US-lessac-medium",
+        validation_alias="PIPER_VOICE",
+        description="Piper voice model name (e.g. 'en_US-lessac-medium', 'en_US-lessac-low')",
+    )
+    piper_model_path: Optional[str] = Field(
         default=None,
-        validation_alias="OPENAI_API_KEY",
-        description="OpenAI API Key for STT (Whisper) and TTS (Alloy) plugins",
+        validation_alias="PIPER_MODEL_PATH",
+        description="Direct path to Piper .onnx model file (optional)",
+    )
+    piper_config_path: Optional[str] = Field(
+        default=None,
+        validation_alias="PIPER_CONFIG_PATH",
+        description="Direct path to Piper .onnx.json config file (optional)",
     )
 
     # Agent runtime settings
@@ -67,13 +94,8 @@ class Settings(BaseSettings):
         """Check if Google Gemini API key is provided."""
         return bool(self.gemini_api_key)
 
-    @property
-    def is_openai_configured(self) -> bool:
-        """Check if OpenAI API key is provided."""
-        return bool(self.openai_api_key)
-
     def validate_environment(self) -> None:
-        """Validates that all required environment variables for LiveKit, Gemini LLM, and OpenAI STT/TTS are set.
+        """Validates that all required environment variables for LiveKit and Gemini LLM are set.
 
         Raises:
             ValueError: If any required configuration variables are missing or empty.
@@ -87,8 +109,6 @@ class Settings(BaseSettings):
             missing.append("LIVEKIT_API_SECRET")
         if not self.gemini_api_key:
             missing.append("GEMINI_API_KEY")
-        if not self.openai_api_key:
-            missing.append("OPENAI_API_KEY (required for OpenAI STT/TTS)")
 
         if missing:
             raise ValueError(

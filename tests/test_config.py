@@ -1,6 +1,6 @@
 """Tests for configuration settings and environment loading."""
 
-import os
+import pytest
 from zcloud_ai_telecaller.config import Settings, get_settings
 
 
@@ -9,6 +9,12 @@ def test_default_settings():
     settings = Settings()
     assert settings.agent_name == "zcloud-ai-telecaller-agent"
     assert settings.agent_log_level == "INFO"
+    assert settings.whisper_model_size == "base"
+    assert settings.whisper_device == "cpu"
+    assert settings.whisper_compute_type == "int8"
+    assert settings.piper_voice == "en_US-lessac-medium"
+    assert settings.piper_model_path is None
+    assert settings.piper_config_path is None
 
 
 def test_custom_settings_from_env(monkeypatch):
@@ -19,7 +25,12 @@ def test_custom_settings_from_env(monkeypatch):
     monkeypatch.setenv("LIVEKIT_API_KEY", "test-api-key")
     monkeypatch.setenv("LIVEKIT_API_SECRET", "test-api-secret")
     monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
-    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("WHISPER_MODEL_SIZE", "tiny")
+    monkeypatch.setenv("WHISPER_DEVICE", "cpu")
+    monkeypatch.setenv("WHISPER_COMPUTE_TYPE", "int8")
+    monkeypatch.setenv("PIPER_VOICE", "en_US-lessac-low")
+    monkeypatch.setenv("PIPER_MODEL_PATH", "/path/to/custom.onnx")
+    monkeypatch.setenv("PIPER_CONFIG_PATH", "/path/to/custom.onnx.json")
 
     settings = get_settings()
     assert settings.agent_name == "custom-telecaller-agent"
@@ -28,22 +39,26 @@ def test_custom_settings_from_env(monkeypatch):
     assert settings.livekit_api_key == "test-api-key"
     assert settings.livekit_api_secret == "test-api-secret"
     assert settings.gemini_api_key == "test-gemini-key"
-    assert settings.openai_api_key == "test-openai-key"
+    assert settings.whisper_model_size == "tiny"
+    assert settings.whisper_device == "cpu"
+    assert settings.whisper_compute_type == "int8"
+    assert settings.piper_voice == "en_US-lessac-low"
+    assert settings.piper_model_path == "/path/to/custom.onnx"
+    assert settings.piper_config_path == "/path/to/custom.onnx.json"
     assert settings.is_livekit_configured is True
     assert settings.is_gemini_configured is True
-    assert settings.is_openai_configured is True
 
 
-def test_validate_environment_success(monkeypatch):
-    """Verify validate_environment passes when all required variables are set."""
+def test_validate_environment_success_without_openai(monkeypatch):
+    """Verify validate_environment passes without any OPENAI_API_KEY set."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("LIVEKIT_URL", "wss://test.livekit.cloud")
     monkeypatch.setenv("LIVEKIT_API_KEY", "key123")
     monkeypatch.setenv("LIVEKIT_API_SECRET", "secret123")
     monkeypatch.setenv("GEMINI_API_KEY", "AIzaSyTestKey123")
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test12345")
 
     settings = Settings()
-    # Should complete without error
+    # Must complete without error, requiring zero OpenAI configuration
     settings.validate_environment()
 
 
@@ -60,9 +75,7 @@ def test_validate_environment_missing_keys(monkeypatch):
         livekit_api_key=None,
         livekit_api_secret=None,
         gemini_api_key=None,
-        openai_api_key=None,
     )
-    import pytest
 
     with pytest.raises(ValueError) as exc_info:
         settings.validate_environment()
@@ -72,5 +85,4 @@ def test_validate_environment_missing_keys(monkeypatch):
     assert "LIVEKIT_API_KEY" in err_msg
     assert "LIVEKIT_API_SECRET" in err_msg
     assert "GEMINI_API_KEY" in err_msg
-    assert "OPENAI_API_KEY" in err_msg
-
+    assert "OPENAI_API_KEY" not in err_msg
