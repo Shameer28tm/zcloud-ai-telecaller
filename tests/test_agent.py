@@ -45,3 +45,60 @@ def test_prewarm():
     assert "vad" in proc.userdata
     assert proc.userdata["vad"] is not None
 
+
+@pytest.mark.asyncio
+async def test_entrypoint_lifecycle(monkeypatch):
+    """Verify that entrypoint awaits session.start and registers an async shutdown callback."""
+    import inspect
+    from unittest.mock import AsyncMock, MagicMock
+    from zcloud_ai_telecaller import agent
+
+    mock_room = MagicMock()
+    mock_room.name = "test-room"
+
+    mock_job = MagicMock()
+    mock_job.id = "test-job-id"
+
+    mock_participant = MagicMock()
+    mock_participant.identity = "test-participant"
+    mock_participant.sid = "PA_123"
+
+    registered_shutdown_callbacks = []
+
+    mock_ctx = MagicMock()
+    mock_ctx.room = mock_room
+    mock_ctx.job = mock_job
+    mock_ctx.proc = MagicMock()
+    mock_ctx.proc.userdata = {}
+    mock_ctx.connect = AsyncMock()
+    mock_ctx.wait_for_participant = AsyncMock(return_value=mock_participant)
+    mock_ctx.add_shutdown_callback = lambda cb: registered_shutdown_callbacks.append(cb)
+
+    mock_session = MagicMock()
+    mock_session.on = MagicMock(return_value=lambda fn: fn)
+    mock_session.start = AsyncMock()
+    mock_session.say = AsyncMock()
+
+    monkeypatch.setattr(agent, "create_agent_session", lambda **kwargs: mock_session)
+
+    await agent.entrypoint(mock_ctx)
+
+    # 1. Verify connect and wait_for_participant were awaited
+    mock_ctx.connect.assert_awaited_once()
+    mock_ctx.wait_for_participant.assert_awaited_once()
+
+    # 2. Verify session.start was awaited
+    mock_session.start.assert_awaited_once()
+
+    # 3. Verify session.say was awaited with greeting
+    mock_session.say.assert_awaited_once_with(agent.GREETING_MESSAGE)
+
+    # 4. Verify shutdown callback was registered as an async coroutine function
+    assert len(registered_shutdown_callbacks) == 1
+    shutdown_cb = registered_shutdown_callbacks[0]
+    assert inspect.iscoroutinefunction(shutdown_cb), "Shutdown callback must be an async coroutine function"
+
+    # 5. Verify invoking shutdown callback produces an awaitable coroutine
+    await shutdown_cb()
+
+

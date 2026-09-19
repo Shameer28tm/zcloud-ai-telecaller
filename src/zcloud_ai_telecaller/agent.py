@@ -122,14 +122,14 @@ async def entrypoint(ctx: JobContext) -> None:
         else:
             logger.info("Session ended normally for room %s (reason: %s)", ctx.room.name, reason)
 
-    def on_shutdown() -> None:
+    async def on_shutdown() -> None:
         logger.info("Worker session cleanup/shutdown completed for room: %s", ctx.room.name)
 
     ctx.add_shutdown_callback(on_shutdown)
 
     # 6. Start the voice pipeline session
     logger.info("Voice session started for room: %s with participant: %s", ctx.room.name, participant.identity)
-    session.start(agent, room=ctx.room)
+    await session.start(agent, room=ctx.room)
 
     # 7. Initial voice greeting to user
     await session.say(GREETING_MESSAGE)
