@@ -10,6 +10,7 @@ import os
 import sys
 from typing import Optional
 
+from livekit import rtc
 from livekit.agents import (
     Agent,
     AgentSession,
@@ -28,6 +29,9 @@ from zcloud_ai_telecaller.local_tts import PiperTTS
 from zcloud_ai_telecaller.logging_config import setup_logging
 from zcloud_ai_telecaller.runtime_client import (
     AgentRuntimeConfig,
+    CallSessionAccumulator,
+    CallSessionReport,
+    CallTranscriptItem,
     RuntimeConfigClient,
     extract_participant_metadata,
 )
@@ -140,6 +144,9 @@ async def entrypoint(ctx: JobContext) -> None:
     greeting = GREETING_MESSAGE
     piper_voice = settings.piper_voice
 
+    client: Optional[RuntimeConfigClient] = None
+    accumulator: Optional[CallSessionAccumulator] = None
+
     metadata_raw: Optional[str] = None
     part_meta = getattr(participant, "metadata", None)
     room_meta = getattr(ctx.room, "metadata", None)
@@ -175,6 +182,16 @@ async def entrypoint(ctx: JobContext) -> None:
             greeting = runtime_config.greeting
             if runtime_config.voice_id:
                 piper_voice = runtime_config.voice_id
+
+            # Initialize authoritative call session accumulator for billing & transcripts
+            accumulator = CallSessionAccumulator(
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                room_name=ctx.room.name,
+                agent_version_id=runtime_config.agent_version_id,
+                caller_identity=participant.identity,
+                caller_name=getattr(participant, "name", None) or participant.identity,
+            )
         except Exception as exc:
             logger.error(
                 "Failed to fetch or apply runtime configuration from control plane: %s. Aborting session.",
@@ -208,7 +225,73 @@ async def entrypoint(ctx: JobContext) -> None:
         logger.error("Failed to initialize voice session components: %s", exc)
         raise
 
-    # 6. Attach event listeners for structured lifecycle logging & error tracking
+    # 6. Attach event listeners for transcripts, metering, and lifecycle tracking
+    reported_lock = asyncio.Lock()
+    has_reported = False
+
+    async def finalize_and_report_call(reason: str) -> None:
+        nonlocal has_reported
+        async with reported_lock:
+            if has_reported:
+                return
+            has_reported = True
+
+        if not accumulator or not client:
+            return
+
+        try:
+            # Fallback check: inspect session.history to capture any turns that didn't fire an event
+            try:
+                if hasattr(session, "history") and hasattr(session.history, "messages"):
+                    raw_messages = session.history.messages
+                    history_messages = raw_messages() if callable(raw_messages) else raw_messages
+                    for msg in history_messages:
+                        accumulator.record_livekit_item(msg)
+            except Exception as hist_err:
+                logger.debug("Could not inspect session history: %s", hist_err)
+
+            report = accumulator.finish(reason=reason)
+            logger.info(
+                "Submitting authoritative call session to control plane: room=%s, duration=%ss, turns=%s",
+                report.room_name,
+                report.duration_seconds,
+                len(report.transcripts),
+            )
+            result = await client.report_call_session(report)
+            logger.info(
+                "Call session successfully saved in control plane: callId=%s, billableMinutes=%s, isDuplicate=%s",
+                result.get("callId"),
+                result.get("billableMinutes"),
+                result.get("isDuplicate"),
+            )
+        except Exception as rep_err:
+            logger.error(
+                "Failed to report call session to control plane for room %s: %s",
+                ctx.room.name,
+                rep_err,
+            )
+
+    @session.on("conversation_item_added")
+    def on_conversation_item_added(ev) -> None:
+        if accumulator:
+            item = getattr(ev, "item", ev)
+            accumulator.record_livekit_item(item)
+
+    @ctx.room.on("data_received")
+    def on_data_received(dp: rtc.DataPacket) -> None:
+        try:
+            if not dp.data:
+                return
+            text = dp.data.decode("utf-8").strip()
+            if not text:
+                return
+            logger.info("Received query from participant '%s': %s", getattr(dp.participant, "identity", "unknown"), text)
+            if accumulator:
+                accumulator.add_transcript(speaker="CUSTOMER", message=text)
+            asyncio.create_task(session.generate_reply(user_input=text))
+        except Exception as data_err:
+            logger.error("Error handling data packet from participant: %s", data_err)
+
     @session.on("error")
     def on_session_error(ev) -> None:
         err = getattr(ev, "error", ev)
@@ -222,8 +305,10 @@ async def entrypoint(ctx: JobContext) -> None:
             logger.error("Session ended with error in room %s: %s (reason: %s)", ctx.room.name, err, reason)
         else:
             logger.info("Session ended normally for room %s (reason: %s)", ctx.room.name, reason)
+        asyncio.create_task(finalize_and_report_call(str(reason)))
 
     async def on_shutdown() -> None:
+        await finalize_and_report_call("shutdown")
         logger.info("Worker session cleanup/shutdown completed for room: %s", ctx.room.name)
 
     ctx.add_shutdown_callback(on_shutdown)
@@ -233,6 +318,12 @@ async def entrypoint(ctx: JobContext) -> None:
     await session.start(agent, room=ctx.room)
 
     # 8. Initial voice greeting to caller
+    if accumulator:
+        accumulator.add_transcript(
+            speaker="AGENT",
+            message=greeting,
+            timestamp_offset_ms=0,
+        )
     await session.say(greeting)
 
 

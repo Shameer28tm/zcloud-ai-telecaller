@@ -1,8 +1,10 @@
 """Client and models for fetching dynamic agent configuration from the Control Plane runtime API."""
 
 import asyncio
+import datetime
 import json
 import logging
+import time
 from typing import Any, Optional
 
 import aiohttp
@@ -55,6 +57,205 @@ class AgentRuntimeConfig(BaseModel):
     tools_config: Any = Field(default_factory=dict, validation_alias="toolsConfig")
     business_hours: Optional[Any] = Field(default=None, validation_alias="businessHours")
     transfer_rules: Any = Field(default_factory=dict, validation_alias="transferRules")
+
+
+class CallTranscriptItem(BaseModel):
+    """Individual transcript turn recorded during a call session."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    speaker: str = "AGENT"  # "AGENT" | "CUSTOMER" | "SYSTEM"
+    message: str
+    timestamp_offset_ms: int = Field(default=0, validation_alias="timestampOffsetMs", serialization_alias="timestampOffsetMs")
+    latency_ms: Optional[int] = Field(default=None, validation_alias="latencyMs", serialization_alias="latencyMs")
+    confidence: Optional[float] = None
+
+
+class CallSessionReport(BaseModel):
+    """Complete call session payload submitted authoritatively by worker upon call termination."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    tenant_id: str = Field(validation_alias="tenantId", serialization_alias="tenantId")
+    agent_id: str = Field(validation_alias="agentId", serialization_alias="agentId")
+    agent_version_id: Optional[str] = Field(default=None, validation_alias="agentVersionId", serialization_alias="agentVersionId")
+    room_name: str = Field(validation_alias="roomName", serialization_alias="roomName")
+    caller_identity: Optional[str] = Field(default=None, validation_alias="callerIdentity", serialization_alias="callerIdentity")
+    caller_number: Optional[str] = Field(default=None, validation_alias="callerNumber", serialization_alias="callerNumber")
+    caller_name: Optional[str] = Field(default=None, validation_alias="callerName", serialization_alias="callerName")
+    direction: str = "INBOUND"
+    started_at: Optional[str] = Field(default=None, validation_alias="startedAt", serialization_alias="startedAt")
+    ended_at: Optional[str] = Field(default=None, validation_alias="endedAt", serialization_alias="endedAt")
+    duration_seconds: int = Field(default=0, validation_alias="durationSeconds", serialization_alias="durationSeconds")
+    status: str = "COMPLETED"
+    intent: Optional[str] = None
+    outcome: Optional[str] = None
+    summary: Optional[str] = None
+    sentiment: Optional[str] = None
+    end_reason: Optional[str] = Field(default=None, validation_alias="endReason", serialization_alias="endReason")
+    transcripts: list[CallTranscriptItem] = Field(default_factory=list)
+
+
+class CallSessionAccumulator:
+    """Accumulates transcript turns, offsets, and call duration for authoritative session reporting."""
+
+    def __init__(
+        self,
+        tenant_id: str,
+        agent_id: str,
+        room_name: str,
+        agent_version_id: Optional[str] = None,
+        caller_identity: Optional[str] = None,
+        caller_number: Optional[str] = None,
+        caller_name: Optional[str] = None,
+        start_time: Optional[float] = None,
+    ) -> None:
+        self.tenant_id = tenant_id
+        self.agent_id = agent_id
+        self.room_name = room_name
+        self.agent_version_id = agent_version_id
+        self.caller_identity = caller_identity
+        self.caller_number = caller_number
+        self.caller_name = caller_name
+        self.start_time = start_time if start_time is not None else time.time()
+        self.end_time: Optional[float] = None
+        self.end_reason: Optional[str] = None
+        self.status: str = "COMPLETED"
+        self.transcripts: list[CallTranscriptItem] = []
+        self._seen_messages: dict[tuple[str, str], int] = {}
+
+    def add_transcript(
+        self,
+        speaker: str,
+        message: str,
+        timestamp_offset_ms: Optional[int] = None,
+        latency_ms: Optional[int] = None,
+        confidence: Optional[float] = None,
+    ) -> bool:
+        """Appends a transcript turn with offset, discarding empty or duplicate turns."""
+        clean_msg = message.strip()
+        if not clean_msg:
+            return False
+
+        if timestamp_offset_ms is None:
+            now = time.time()
+            timestamp_offset_ms = max(0, int((now - self.start_time) * 1000))
+
+        # Deduplicate identical message from the same speaker within 4 seconds
+        dedup_key = (speaker, clean_msg)
+        if dedup_key in self._seen_messages:
+            last_ts = self._seen_messages[dedup_key]
+            if abs(timestamp_offset_ms - last_ts) < 4000:
+                return False
+
+        self._seen_messages[dedup_key] = timestamp_offset_ms
+        self.transcripts.append(
+            CallTranscriptItem(
+                speaker=speaker,
+                message=clean_msg,
+                timestamp_offset_ms=timestamp_offset_ms,
+                latency_ms=latency_ms,
+                confidence=confidence,
+            )
+        )
+        return True
+
+    def record_livekit_item(
+        self,
+        item: Any,
+        timestamp_offset_ms: Optional[int] = None,
+    ) -> bool:
+        """Extracts speaker and text from a LiveKit chat item or event and records it."""
+        # If item is an event wrapping an inner message (like ConversationItemAddedEvent), unwrap it
+        if not hasattr(item, "role") and hasattr(item, "item"):
+            inner = getattr(item, "item", None)
+            if inner is not None:
+                item = inner
+        elif hasattr(item, "item") and hasattr(item, "created_at") and not isinstance(getattr(item, "role", None), str):
+            # LiveKit ConversationItemAddedEvent has .item and .created_at
+            inner = getattr(item, "item", None)
+            if inner is not None:
+                item = inner
+
+        raw_role = getattr(item, "role", None)
+        role = str(raw_role or "").lower()
+        if role in ("system", "developer"):
+            return False
+
+        speaker = "CUSTOMER" if role == "user" else "AGENT"
+
+        text = ""
+        if hasattr(item, "text_content"):
+            text_val = item.text_content
+            if callable(text_val) and not isinstance(text_val, (str, bytes)):
+                text = str(text_val())
+            else:
+                text = str(text_val)
+        elif hasattr(item, "content"):
+            content = getattr(item, "content")
+            if isinstance(content, list):
+                text = " ".join(str(c) for c in content if c)
+            else:
+                text = str(content)
+
+        text = text.strip()
+        if not text:
+            return False
+
+        confidence_val = getattr(item, "transcript_confidence", None)
+        confidence: Optional[float] = None
+        if isinstance(confidence_val, (int, float)):
+            confidence = float(confidence_val)
+
+        latency_val = getattr(item, "latency_ms", None)
+        latency_ms: Optional[int] = None
+        if isinstance(latency_val, (int, float)):
+            latency_ms = int(latency_val)
+
+        return self.add_transcript(
+            speaker=speaker,
+            message=text,
+            timestamp_offset_ms=timestamp_offset_ms,
+            latency_ms=latency_ms,
+            confidence=confidence,
+        )
+
+    def finish(
+        self,
+        reason: Optional[str] = None,
+        status: str = "COMPLETED",
+        end_time: Optional[float] = None,
+    ) -> CallSessionReport:
+        """Finalizes timestamps and builds the authoritative CallSessionReport."""
+        self.end_time = end_time if end_time is not None else time.time()
+        self.end_reason = reason or "normal"
+        self.status = status
+
+        duration_seconds = max(0, int(round(self.end_time - self.start_time)))
+
+        started_at = datetime.datetime.fromtimestamp(
+            self.start_time, tz=datetime.timezone.utc
+        ).isoformat()
+        ended_at = datetime.datetime.fromtimestamp(
+            self.end_time, tz=datetime.timezone.utc
+        ).isoformat()
+
+        return CallSessionReport(
+            tenant_id=self.tenant_id,
+            agent_id=self.agent_id,
+            agent_version_id=self.agent_version_id,
+            room_name=self.room_name,
+            caller_identity=self.caller_identity,
+            caller_number=self.caller_number,
+            caller_name=self.caller_name,
+            direction="INBOUND",
+            started_at=started_at,
+            ended_at=ended_at,
+            duration_seconds=duration_seconds,
+            status=self.status,
+            end_reason=self.end_reason,
+            transcripts=list(self.transcripts),
+        )
 
 
 def extract_participant_metadata(metadata_raw: Optional[str]) -> tuple[str, str, Optional[str]]:
@@ -199,4 +400,85 @@ class RuntimeConfigClient:
         except (aiohttp.ClientError, asyncio.TimeoutError) as net_err:
             raise RuntimeClientConnectionError(
                 f"Failed to communicate with control plane at {self.base_url}: {net_err}"
+            ) from net_err
+
+    async def report_call_session(
+        self,
+        report: CallSessionReport,
+    ) -> dict[str, Any]:
+        """Reports completed call session details, transcripts, and duration to the control plane.
+
+        Args:
+            report: CallSessionReport containing call metadata, duration, and transcripts.
+
+        Returns:
+            dict containing response data (e.g. callId, billableMinutes, transcriptCount).
+
+        Raises:
+            RuntimeClientValidationError: If payload is invalid (400) or tenant is inactive (403).
+            RuntimeClientAuthError: If authentication fails (401).
+            RuntimeClientNotFoundError: If tenant or agent is not found (404).
+            RuntimeClientConnectionError: If network request fails or server errors out.
+        """
+        if not self.worker_api_secret:
+            raise RuntimeClientAuthError("Worker API secret is not configured")
+
+        url = f"{self.base_url}/api/internal/call-session"
+        headers = {
+            "Authorization": f"Bearer {self.worker_api_secret}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        payload = report.model_dump(by_alias=True, exclude_none=True)
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload, headers=headers) as resp:
+                    if resp.status == 200:
+                        try:
+                            body = await resp.json()
+                        except Exception as json_err:
+                            raise RuntimeClientConnectionError(
+                                f"Invalid JSON received from control plane: {json_err}"
+                            ) from json_err
+
+                        if not body.get("success") or "data" not in body:
+                            msg = body.get("error", {}).get("message", "Malformed response from control plane")
+                            raise RuntimeClientValidationError(msg)
+
+                        return body["data"]
+
+                    if resp.status == 401:
+                        raise RuntimeClientAuthError("Control plane rejected worker API secret (401 Unauthorized)")
+
+                    if resp.status == 404:
+                        raise RuntimeClientNotFoundError(
+                            f"Tenant or agent not found in control plane for call session {report.room_name} (404 Not Found)"
+                        )
+
+                    if resp.status == 400:
+                        try:
+                            err_body = await resp.json()
+                            err_msg = err_body.get("error", {}).get("message", "Bad call-session request to control plane")
+                        except Exception:
+                            err_msg = "Bad call-session request to control plane (400)"
+                        raise RuntimeClientValidationError(err_msg)
+
+                    if resp.status == 403:
+                        try:
+                            err_body = await resp.json()
+                            err_msg = err_body.get("error", {}).get("message", "Tenant is inactive or suspended")
+                        except Exception:
+                            err_msg = "Tenant is inactive or suspended (403)"
+                        raise RuntimeClientValidationError(err_msg)
+
+                    raise RuntimeClientConnectionError(
+                        f"Control plane returned unexpected HTTP status {resp.status}"
+                    )
+        except (RuntimeClientError,):
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as net_err:
+            raise RuntimeClientConnectionError(
+                f"Failed to report call session to control plane at {self.base_url}: {net_err}"
             ) from net_err
