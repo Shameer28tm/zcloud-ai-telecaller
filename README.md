@@ -22,6 +22,32 @@ Browser / WebRTC  <--->  LiveKit Server  <--->  AI Agent Worker
 - **TTS**: Local `piper-tts` neural voice synthesis
 - **Transport**: LiveKit WebRTC audio streaming
 
+## Phase 2A: Control Plane -> Python Worker Integration
+
+In Phase 2A, the hardcoded instructions and greeting are replaced with dynamic, multi-tenant runtime configuration fetched from the Next.js Control Plane (`LIVEKIT-AGENT-`):
+
+```text
+Dashboard (Agent Editor)
+         ↓
+Published AgentVersion
+         ↓
+Control Plane Internal API  (GET /api/internal/agent-runtime with WORKER_API_SECRET)
+         ↓
+Python LiveKit Worker
+         ↓
+LiveKit Participant Metadata (tenantId, agentId, agentVersionId)
+         ↓
+Dynamic Agent Prompt & Greeting Injection
+         ↓
+Gemini 2.5 Flash Voice Session
+```
+
+Key guarantees:
+- **Zero Exposed Secrets**: Machine-to-machine authentication via `Authorization: Bearer <WORKER_API_SECRET>`. The API strips internal secrets before sending.
+- **Strict Multi-Tenant Isolation**: Tenant IDs and agent IDs are strictly cross-verified; cross-tenant attempts return `404 Not Found`.
+- **Published Version Enforcement**: Unpublished draft versions are rejected (`400 VERSION_UNPUBLISHED`).
+- **Safe Session Abort**: If metadata or version verification fails, the worker aborts the session immediately without falling back to cross-tenant or unauthenticated data.
+
 ## Project Structure
 
 ```text
@@ -40,12 +66,14 @@ zcloud-ai-telecaller/
 │       ├── config.py            # Pydantic Settings configuration management
 │       ├── local_stt.py         # Local faster-whisper STT implementation (LiveKit STT)
 │       ├── local_tts.py         # Local Piper TTS implementation (LiveKit TTS)
-│       └── logging_config.py    # Structured logging configuration
+│       ├── logging_config.py    # Structured logging configuration
+│       └── runtime_client.py    # Control plane dynamic runtime configuration client
 └── tests/
     ├── __init__.py
     ├── test_agent.py            # Agent, local STT/TTS pipeline, and lifecycle tests
     ├── test_config.py           # Configuration and environment tests
-    └── test_logging.py          # Logging setup tests
+    ├── test_logging.py          # Logging setup tests
+    └── test_runtime_client.py   # Phase 2A runtime client and prompt injection tests
 ```
 
 ## Getting Started

@@ -49,6 +49,21 @@ def test_custom_settings_from_env(monkeypatch):
     assert settings.is_gemini_configured is True
 
 
+def test_control_plane_configuration(monkeypatch):
+    """Verify control plane URL and worker API secret loading and property flag."""
+    settings_default = Settings(control_plane_url="http://localhost:3000", worker_api_secret=None)
+    assert settings_default.control_plane_url == "http://localhost:3000"
+    assert settings_default.worker_api_secret is None
+    assert settings_default.is_control_plane_configured is False
+
+    monkeypatch.setenv("CONTROL_PLANE_URL", "https://controlplane.zcloud.internal")
+    monkeypatch.setenv("WORKER_API_SECRET", "super_secret_m2m_token_99")
+    settings_custom = Settings()
+    assert settings_custom.control_plane_url == "https://controlplane.zcloud.internal"
+    assert settings_custom.worker_api_secret == "super_secret_m2m_token_99"
+    assert settings_custom.is_control_plane_configured is True
+
+
 def test_validate_environment_success_without_openai(monkeypatch):
     """Verify validate_environment passes without any OPENAI_API_KEY set."""
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)

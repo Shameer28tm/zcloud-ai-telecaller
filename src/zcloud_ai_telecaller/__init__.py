@@ -6,6 +6,11 @@ from zcloud_ai_telecaller.logging_config import setup_logging
 
 from zcloud_ai_telecaller.local_stt import FasterWhisperSTT
 from zcloud_ai_telecaller.local_tts import PiperTTS
+from zcloud_ai_telecaller.runtime_client import (
+    AgentRuntimeConfig,
+    RuntimeConfigClient,
+    extract_participant_metadata,
+)
 
 
 def main() -> None:
@@ -22,5 +27,8 @@ __all__ = [
     "setup_logging",
     "FasterWhisperSTT",
     "PiperTTS",
+    "AgentRuntimeConfig",
+    "RuntimeConfigClient",
+    "extract_participant_metadata",
 ]
 

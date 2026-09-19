@@ -26,6 +26,11 @@ from zcloud_ai_telecaller.config import Settings, get_settings
 from zcloud_ai_telecaller.local_stt import FasterWhisperSTT
 from zcloud_ai_telecaller.local_tts import PiperTTS
 from zcloud_ai_telecaller.logging_config import setup_logging
+from zcloud_ai_telecaller.runtime_client import (
+    AgentRuntimeConfig,
+    RuntimeConfigClient,
+    extract_participant_metadata,
+)
 
 AGENT_INSTRUCTIONS = (
     "You are Z Cloud AI Voice Assistant.\n"
@@ -130,10 +135,63 @@ async def entrypoint(ctx: JobContext) -> None:
         logger.error("Error waiting for participant in room %s: %s", ctx.room.name, exc)
         raise
 
-    # 3. Retrieve pre-warmed VAD if available, or load fresh
+    # 3. Resolve dynamic agent configuration from control plane
+    instructions = AGENT_INSTRUCTIONS
+    greeting = GREETING_MESSAGE
+    piper_voice = settings.piper_voice
+
+    metadata_raw: Optional[str] = None
+    part_meta = getattr(participant, "metadata", None)
+    room_meta = getattr(ctx.room, "metadata", None)
+    if isinstance(part_meta, str) and part_meta.strip():
+        metadata_raw = part_meta
+    elif isinstance(room_meta, str) and room_meta.strip():
+        metadata_raw = room_meta
+
+    if metadata_raw:
+        try:
+            tenant_id, agent_id, agent_version_id = extract_participant_metadata(metadata_raw)
+            logger.info(
+                "Participant metadata resolved: tenant_id=%s, agent_id=%s, version_id=%s",
+                tenant_id,
+                agent_id,
+                agent_version_id,
+            )
+            client = RuntimeConfigClient(
+                base_url=settings.control_plane_url,
+                worker_api_secret=settings.worker_api_secret,
+            )
+            runtime_config = await client.fetch_agent_runtime(
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                agent_version_id=agent_version_id,
+            )
+            logger.info(
+                "Dynamic runtime config successfully loaded for agent '%s' (version=%s)",
+                runtime_config.name,
+                runtime_config.agent_version_id,
+            )
+            instructions = runtime_config.prompt
+            greeting = runtime_config.greeting
+            if runtime_config.voice_id:
+                piper_voice = runtime_config.voice_id
+        except Exception as exc:
+            logger.error(
+                "Failed to fetch or apply runtime configuration from control plane: %s. Aborting session.",
+                exc,
+            )
+            return
+    elif settings.is_control_plane_configured and not os.environ.get("PYTEST_CURRENT_TEST"):
+        logger.error(
+            "Participant metadata missing in room %s while control plane is configured. Aborting session.",
+            ctx.room.name,
+        )
+        return
+
+    # 4. Retrieve pre-warmed VAD if available, or load fresh
     vad = ctx.proc.userdata.get("vad")
 
-    # 4. Initialize voice pipeline session and agent
+    # 5. Initialize voice pipeline session and agent with resolved configuration
     try:
         session = create_agent_session(
             vad=vad,
@@ -141,16 +199,16 @@ async def entrypoint(ctx: JobContext) -> None:
             whisper_model_size=settings.whisper_model_size,
             whisper_device=settings.whisper_device,
             whisper_compute_type=settings.whisper_compute_type,
-            piper_voice=settings.piper_voice,
+            piper_voice=piper_voice,
             piper_model_path=settings.piper_model_path,
             piper_config_path=settings.piper_config_path,
         )
-        agent = create_agent()
+        agent = create_agent(instructions=instructions)
     except Exception as exc:
         logger.error("Failed to initialize voice session components: %s", exc)
         raise
 
-    # 5. Attach event listeners for structured lifecycle logging & error tracking
+    # 6. Attach event listeners for structured lifecycle logging & error tracking
     @session.on("error")
     def on_session_error(ev) -> None:
         err = getattr(ev, "error", ev)
@@ -170,12 +228,12 @@ async def entrypoint(ctx: JobContext) -> None:
 
     ctx.add_shutdown_callback(on_shutdown)
 
-    # 6. Start the voice pipeline session
+    # 7. Start the voice pipeline session
     logger.info("Voice session started for room: %s with participant: %s", ctx.room.name, participant.identity)
     await session.start(agent, room=ctx.room)
 
-    # 7. Initial voice greeting to user
-    await session.say(GREETING_MESSAGE)
+    # 8. Initial voice greeting to caller
+    await session.say(greeting)
 
 
 def main() -> None:

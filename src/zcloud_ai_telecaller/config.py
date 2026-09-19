@@ -84,6 +84,18 @@ class Settings(BaseSettings):
         description="Agent logging level (DEBUG, INFO, WARNING, ERROR)",
     )
 
+    # Control Plane Runtime API settings (Phase 2A)
+    control_plane_url: str = Field(
+        default="http://localhost:3000",
+        validation_alias="CONTROL_PLANE_URL",
+        description="Base URL for the Next.js control plane (e.g. http://localhost:3000)",
+    )
+    worker_api_secret: Optional[str] = Field(
+        default=None,
+        validation_alias="WORKER_API_SECRET",
+        description="Internal machine-to-machine worker API secret for control plane authentication",
+    )
+
     @property
     def is_livekit_configured(self) -> bool:
         """Check if all LiveKit connection credentials are provided."""
@@ -93,6 +105,11 @@ class Settings(BaseSettings):
     def is_gemini_configured(self) -> bool:
         """Check if Google Gemini API key is provided."""
         return bool(self.gemini_api_key)
+
+    @property
+    def is_control_plane_configured(self) -> bool:
+        """Check if control plane connection and secret are configured."""
+        return bool(self.control_plane_url and self.worker_api_secret)
 
     def validate_environment(self) -> None:
         """Validates that all required environment variables for LiveKit and Gemini LLM are set.
