@@ -30,5 +30,9 @@ RUN uv sync --frozen --no-dev
 ENV PATH="/app/.venv/bin:$PATH"
 ENV PYTHONUNBUFFERED=1
 
+# Download and pre-cache model weights (e.g. Silero VAD) into the container image
+RUN python -m livekit.agents download-files
+
 # Run the LiveKit Agent worker
 CMD ["python", "-m", "zcloud_ai_telecaller.agent", "start"]
+
