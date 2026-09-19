@@ -25,13 +25,23 @@ def test_create_agent():
 
 @pytest.mark.asyncio
 async def test_create_agent_session():
-    """Verify that create_agent_session initializes the voice pipeline plugins (VAD, STT, LLM, TTS)."""
-    session = create_agent_session()
+    """Verify that create_agent_session initializes the voice pipeline with Google Gemini LLM."""
+    from livekit.plugins import google, openai
+
+    session = create_agent_session(gemini_api_key="test-gemini-key")
     assert session is not None
     assert session.vad is not None
     assert session.stt is not None
     assert session.llm is not None
     assert session.tts is not None
+
+    # Ensure Gemini LLM is configured
+    assert isinstance(session.llm, google.LLM)
+    assert session.llm.model == "gemini-2.5-flash"
+
+    # Ensure OpenAI LLM is NOT instantiated in the session
+    assert not isinstance(session.llm, openai.LLM)
+
 
 
 def test_prewarm():

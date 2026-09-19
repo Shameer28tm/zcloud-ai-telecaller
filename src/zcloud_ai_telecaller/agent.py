@@ -19,7 +19,7 @@ from livekit.agents import (
     WorkerOptions,
     cli,
 )
-from livekit.plugins import openai, silero
+from livekit.plugins import google, openai, silero
 
 from zcloud_ai_telecaller.config import Settings, get_settings
 from zcloud_ai_telecaller.logging_config import setup_logging
@@ -43,17 +43,30 @@ def create_agent(instructions: str = AGENT_INSTRUCTIONS) -> Agent:
 
 def create_agent_session(
     vad: Optional[silero.VAD] = None,
+    gemini_api_key: Optional[str] = None,
     openai_api_key: Optional[str] = None,
 ) -> AgentSession:
-    """Creates and configures the AgentSession with VAD, STT, LLM, and TTS plugins."""
-    # Ensure OPENAI_API_KEY is available to plugins if provided
+    """Creates and configures the AgentSession with Silero VAD, OpenAI STT, Google Gemini LLM, and OpenAI TTS."""
+    # Ensure OPENAI_API_KEY is available to STT and TTS plugins
     if openai_api_key:
         os.environ["OPENAI_API_KEY"] = openai_api_key
+
+    # Resolve Gemini API key for Google LLM
+    effective_gemini_key = (
+        gemini_api_key
+        or os.environ.get("GEMINI_API_KEY")
+        or os.environ.get("GOOGLE_API_KEY")
+    )
+    if effective_gemini_key:
+        os.environ["GOOGLE_API_KEY"] = effective_gemini_key
 
     return AgentSession(
         vad=vad or silero.VAD.load(),
         stt=openai.STT(model="whisper-1"),
-        llm=openai.LLM(model="gpt-4o-mini"),
+        llm=google.LLM(
+            model="gemini-2.5-flash",
+            api_key=effective_gemini_key or "dummy-key-for-initialization",
+        ),
         tts=openai.TTS(model="tts-1", voice="alloy"),
     )
 
@@ -101,7 +114,11 @@ async def entrypoint(ctx: JobContext) -> None:
 
     # 4. Initialize voice pipeline session and agent
     try:
-        session = create_agent_session(vad=vad, openai_api_key=settings.openai_api_key)
+        session = create_agent_session(
+            vad=vad,
+            gemini_api_key=settings.gemini_api_key,
+            openai_api_key=settings.openai_api_key,
+        )
         agent = create_agent()
     except Exception as exc:
         logger.error("Failed to initialize voice session components: %s", exc)
@@ -155,7 +172,10 @@ def main() -> None:
             logger.error("Configuration validation failed: %s", err)
             sys.exit(1)
 
-    # Populate OPENAI_API_KEY in environment for third-party libraries
+    # Populate API keys in environment for provider SDKs
+    if settings.gemini_api_key:
+        os.environ["GEMINI_API_KEY"] = settings.gemini_api_key
+        os.environ["GOOGLE_API_KEY"] = settings.gemini_api_key
     if settings.openai_api_key:
         os.environ["OPENAI_API_KEY"] = settings.openai_api_key
 

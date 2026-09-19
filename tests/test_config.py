@@ -18,6 +18,7 @@ def test_custom_settings_from_env(monkeypatch):
     monkeypatch.setenv("LIVEKIT_URL", "wss://custom.livekit.cloud")
     monkeypatch.setenv("LIVEKIT_API_KEY", "test-api-key")
     monkeypatch.setenv("LIVEKIT_API_SECRET", "test-api-secret")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
     monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
 
     settings = get_settings()
@@ -26,8 +27,10 @@ def test_custom_settings_from_env(monkeypatch):
     assert settings.livekit_url == "wss://custom.livekit.cloud"
     assert settings.livekit_api_key == "test-api-key"
     assert settings.livekit_api_secret == "test-api-secret"
+    assert settings.gemini_api_key == "test-gemini-key"
     assert settings.openai_api_key == "test-openai-key"
     assert settings.is_livekit_configured is True
+    assert settings.is_gemini_configured is True
     assert settings.is_openai_configured is True
 
 
@@ -36,6 +39,7 @@ def test_validate_environment_success(monkeypatch):
     monkeypatch.setenv("LIVEKIT_URL", "wss://test.livekit.cloud")
     monkeypatch.setenv("LIVEKIT_API_KEY", "key123")
     monkeypatch.setenv("LIVEKIT_API_SECRET", "secret123")
+    monkeypatch.setenv("GEMINI_API_KEY", "AIzaSyTestKey123")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test12345")
 
     settings = Settings()
@@ -48,12 +52,14 @@ def test_validate_environment_missing_keys(monkeypatch):
     monkeypatch.delenv("LIVEKIT_URL", raising=False)
     monkeypatch.delenv("LIVEKIT_API_KEY", raising=False)
     monkeypatch.delenv("LIVEKIT_API_SECRET", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
     settings = Settings(
         livekit_url=None,
         livekit_api_key=None,
         livekit_api_secret=None,
+        gemini_api_key=None,
         openai_api_key=None,
     )
     import pytest
@@ -65,4 +71,6 @@ def test_validate_environment_missing_keys(monkeypatch):
     assert "LIVEKIT_URL" in err_msg
     assert "LIVEKIT_API_KEY" in err_msg
     assert "LIVEKIT_API_SECRET" in err_msg
+    assert "GEMINI_API_KEY" in err_msg
     assert "OPENAI_API_KEY" in err_msg
+

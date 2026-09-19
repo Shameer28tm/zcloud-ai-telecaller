@@ -12,7 +12,7 @@ Browser / WebRTC  <--->  LiveKit Server  <--->  AI Agent Worker
                      +-----------------------------+-----------------------------+
                      |                             |                             |
                      v                             v                             v
-           Silero VAD / Whisper STT           GPT-4o mini LLM               OpenAI TTS (Alloy)
+           Silero VAD / Whisper STT          Gemini 2.5 Flash               OpenAI TTS (Alloy)
           (Speech-to-Text & VAD)        (Language Intelligence)            (Text-to-Speech)
 ```
 
@@ -47,7 +47,8 @@ zcloud-ai-telecaller/
 - Python `>= 3.12`
 - [uv](https://docs.astral.sh/uv/) package manager
 - LiveKit Cloud account (or self-hosted LiveKit Server)
-- OpenAI API Key
+- Google Gemini API Key (for LLM reasoning & responses)
+- OpenAI API Key (temporarily retained for Whisper STT and OpenAI TTS)
 
 ### 1. Install Dependencies
 
@@ -73,7 +74,10 @@ LIVEKIT_URL=wss://your-project.livekit.cloud
 LIVEKIT_API_KEY=APIxxxxxxxxxxxx
 LIVEKIT_API_SECRET=secxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
-# OpenAI API Key (for Whisper STT, GPT-4o-mini LLM, and TTS Alloy)
+# Google Gemini API Key (for LLM reasoning & response generation)
+GEMINI_API_KEY=AIzaSyxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# OpenAI API Key (temporarily retained for Whisper STT and OpenAI TTS Alloy)
 OPENAI_API_KEY=sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 # Agent Worker Configuration
@@ -134,8 +138,9 @@ When the browser participant connects:
    > *"Hello! I am your Z Cloud AI Voice Assistant. How can I help you today?"*
 3. **Speak into microphone**: Say a test phrase, for example:
    > *"Hi, can you introduce yourself?"*
-4. **Agent Response**: The agent will transcribe your speech via OpenAI Whisper, process it via GPT-4o-mini adhering to the Phase 1 instructions, synthesize speech with OpenAI TTS, and respond over audio:
+4. **Agent Response**: The agent will transcribe your speech via OpenAI Whisper, process it via Google Gemini 2.5 Flash adhering to the Phase 1 instructions, synthesize speech with OpenAI TTS, and respond over audio:
    > *"I am Z Cloud AI Voice Assistant. I am friendly, concise and professional. This is only a Phase 1 technical demo."*
+
 
 ### Running Tests
 
