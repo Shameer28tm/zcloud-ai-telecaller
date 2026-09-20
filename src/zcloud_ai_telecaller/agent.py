@@ -1,14 +1,18 @@
 """LiveKit AI Voice Agent entry point for Z Cloud AI Telecaller.
 
-Voice Pipeline:
-Browser/WebRTC -> LiveKit Room -> Silero VAD / local faster-whisper STT -> Gemini 2.5 Flash LLM -> local Piper TTS -> LiveKit Room -> Browser
+Phase 3 Clinic AI Voice Pipeline:
+Browser/WebRTC -> LiveKit Room -> Silero VAD / local faster-whisper STT ->
+Gemini 2.5 Flash LLM with Backend-Controlled Clinic Tools ->
+local Piper TTS -> LiveKit Room -> Browser
 """
 
 import asyncio
+import datetime
+import json
 import logging
 import os
 import sys
-from typing import Optional
+from typing import Any, Optional
 
 from livekit import rtc
 from livekit.agents import (
@@ -23,10 +27,15 @@ from livekit.agents import (
 )
 from livekit.plugins import google, silero
 
+from zcloud_ai_telecaller.clinic_tools import ClinicToolsManager
 from zcloud_ai_telecaller.config import Settings, get_settings
 from zcloud_ai_telecaller.local_stt import FasterWhisperSTT
 from zcloud_ai_telecaller.local_tts import PiperTTS
 from zcloud_ai_telecaller.logging_config import setup_logging
+from zcloud_ai_telecaller.prompt_builder import (
+    build_clinic_system_prompt,
+    match_deterministic_clinic_query,
+)
 from zcloud_ai_telecaller.runtime_client import (
     AgentRuntimeConfig,
     CallSessionAccumulator,
@@ -48,9 +57,12 @@ AGENT_INSTRUCTIONS = (
 GREETING_MESSAGE = "Hello! I am your Z Cloud AI Voice Assistant. How can I help you today?"
 
 
-def create_agent(instructions: str = AGENT_INSTRUCTIONS) -> Agent:
-    """Creates the base AI voice agent configured with Phase 1 conversational instructions."""
-    return Agent(instructions=instructions)
+def create_agent(
+    instructions: str = AGENT_INSTRUCTIONS,
+    tools: Optional[list[Any]] = None,
+) -> Agent:
+    """Creates the base AI voice agent configured with instructions and backend-controlled tools."""
+    return Agent(instructions=instructions, tools=tools or None)
 
 
 def create_agent_session(
@@ -146,6 +158,9 @@ async def entrypoint(ctx: JobContext) -> None:
 
     client: Optional[RuntimeConfigClient] = None
     accumulator: Optional[CallSessionAccumulator] = None
+    runtime_config: Optional[AgentRuntimeConfig] = None
+    tools_manager: Optional[ClinicToolsManager] = None
+    function_tools: list[Any] = []
 
     metadata_raw: Optional[str] = None
     part_meta = getattr(participant, "metadata", None)
@@ -154,6 +169,15 @@ async def entrypoint(ctx: JobContext) -> None:
         metadata_raw = part_meta
     elif isinstance(room_meta, str) and room_meta.strip():
         metadata_raw = room_meta
+
+    async def broadcast_data_packet(packet_dict: dict[str, Any]) -> None:
+        """Broadcasts data packets to the LiveKit room for the realtime workbench feed."""
+        try:
+            payload = json.dumps(packet_dict).encode("utf-8")
+            if ctx.room and ctx.room.local_participant:
+                await ctx.room.local_participant.publish_data(payload, reliable=True)
+        except Exception as b_err:
+            logger.debug("Could not publish livekit data message: %s", b_err)
 
     if metadata_raw:
         try:
@@ -178,7 +202,12 @@ async def entrypoint(ctx: JobContext) -> None:
                 runtime_config.name,
                 runtime_config.agent_version_id,
             )
-            instructions = runtime_config.prompt
+
+            # Build enriched clinic prompt and configure clinic tools
+            if runtime_config.clinic_profile:
+                instructions = build_clinic_system_prompt(runtime_config)
+            else:
+                instructions = runtime_config.prompt
             greeting = runtime_config.greeting
             if runtime_config.voice_id:
                 piper_voice = runtime_config.voice_id
@@ -192,6 +221,17 @@ async def entrypoint(ctx: JobContext) -> None:
                 caller_identity=participant.identity,
                 caller_name=getattr(participant, "name", None) or participant.identity,
             )
+
+            # Initialize backend-controlled clinic tools
+            tools_manager = ClinicToolsManager(
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                client=client,
+                transfer_rules=runtime_config.transfer_rules if isinstance(runtime_config.transfer_rules, dict) else {},
+                clinic_profile=runtime_config.clinic_profile or {},
+                on_event=broadcast_data_packet,
+            )
+            function_tools = tools_manager.get_function_tools()
         except Exception as exc:
             logger.error(
                 "Failed to fetch or apply runtime configuration from control plane: %s. Aborting session.",
@@ -208,7 +248,7 @@ async def entrypoint(ctx: JobContext) -> None:
     # 4. Retrieve pre-warmed VAD if available, or load fresh
     vad = ctx.proc.userdata.get("vad")
 
-    # 5. Initialize voice pipeline session and agent with resolved configuration
+    # 5. Initialize voice pipeline session and agent with resolved configuration & tools
     try:
         session = create_agent_session(
             vad=vad,
@@ -220,7 +260,10 @@ async def entrypoint(ctx: JobContext) -> None:
             piper_model_path=settings.piper_model_path,
             piper_config_path=settings.piper_config_path,
         )
-        agent = create_agent(instructions=instructions)
+        try:
+            agent = create_agent(instructions=instructions, tools=function_tools)
+        except TypeError:
+            agent = create_agent(instructions=instructions)
     except Exception as exc:
         logger.error("Failed to initialize voice session components: %s", exc)
         raise
@@ -271,11 +314,92 @@ async def entrypoint(ctx: JobContext) -> None:
                 rep_err,
             )
 
+    async def broadcast_speech_and_data(
+        message: str,
+        tool_invocation: Optional[str] = None,
+        tool_result: Optional[str] = None,
+    ) -> None:
+        """Sends audio speech to LiveKit room and mirrors text to data channel."""
+        await broadcast_data_packet({
+            "type": "transcript",
+            "speaker": "AGENT",
+            "message": message,
+            "toolInvocation": tool_invocation,
+            "toolResult": tool_result,
+            "timestamp": datetime.datetime.now().strftime("%I:%M:%S %p"),
+        })
+        await session.say(message)
+
+    async def handle_llm_turn_with_circuit_breaker(user_input: str) -> None:
+        """Executes LLM reply generation with bounded retries and graceful 429 quota handling."""
+        if tools_manager:
+            tools_manager.loop_limiter.reset_turn()
+
+        for attempt in range(3):
+            try:
+                await session.generate_reply(user_input=user_input)
+                return
+            except Exception as exc:
+                err_str = str(exc).lower()
+                is_quota = "429" in err_str or "resource_exhausted" in err_str or "quota" in err_str
+                is_transient = "timeout" in err_str or "temporarily unavailable" in err_str or "503" in err_str
+
+                if is_quota:
+                    logger.warning(
+                        "LLM quota / rate limit exceeded (429). Activating safe deterministic fallback."
+                    )
+                    clinic_phone = (
+                        runtime_config.clinic_profile.get("phone")
+                        if runtime_config and runtime_config.clinic_profile
+                        else "+1 (555) 234-5678"
+                    )
+                    fallback_msg = (
+                        f"I apologize, our automated clinic assistant is experiencing unusually high call volume. "
+                        f"Please hold for our front desk, or contact our reception directly at {clinic_phone}."
+                    )
+                    if accumulator:
+                        accumulator.add_transcript(speaker="AGENT", message=fallback_msg)
+                    await broadcast_speech_and_data(fallback_msg)
+                    return
+
+                if is_transient and attempt < 2:
+                    backoff = 0.5 * (2 ** attempt)
+                    logger.info("Transient LLM error (attempt %d/3). Backing off %.1fs...", attempt + 1, backoff)
+                    await asyncio.sleep(backoff)
+                    continue
+
+                logger.error("LLM reply generation failed: %s", exc)
+                fallback_msg = "I apologize, I am having a moment of difficulty. Could you please repeat that?"
+                if accumulator:
+                    accumulator.add_transcript(speaker="AGENT", message=fallback_msg)
+                await broadcast_speech_and_data(fallback_msg)
+                return
+
     @session.on("conversation_item_added")
     def on_conversation_item_added(ev) -> None:
+        item = getattr(ev, "item", ev)
         if accumulator:
-            item = getattr(ev, "item", ev)
             accumulator.record_livekit_item(item)
+
+        # Mirror agent verbal speech to live data channel
+        try:
+            role = str(getattr(item, "role", "")).lower()
+            if role == "assistant":
+                text = getattr(item, "text_content", None) or getattr(item, "content", "")
+                if callable(text):
+                    text = text()
+                text_str = str(text).strip()
+                if text_str:
+                    asyncio.create_task(
+                        broadcast_data_packet({
+                            "type": "transcript",
+                            "speaker": "AGENT",
+                            "message": text_str,
+                            "timestamp": datetime.datetime.now().strftime("%I:%M:%S %p"),
+                        })
+                    )
+        except Exception as b_err:
+            logger.debug("Could not mirror conversation item to data channel: %s", b_err)
 
     @ctx.room.on("data_received")
     def on_data_received(dp: rtc.DataPacket) -> None:
@@ -288,7 +412,22 @@ async def entrypoint(ctx: JobContext) -> None:
             logger.info("Received query from participant '%s': %s", getattr(dp.participant, "identity", "unknown"), text)
             if accumulator:
                 accumulator.add_transcript(speaker="CUSTOMER", message=text)
-            asyncio.create_task(session.generate_reply(user_input=text))
+
+            # Check deterministic fast-path first to eliminate LLM latency, cost, and hallucinations
+            if runtime_config:
+                fast_path = match_deterministic_clinic_query(text, runtime_config)
+                if fast_path:
+                    resp_text, tool_name = fast_path
+                    logger.info("Fast-path match for query '%s' -> '%s'", text, resp_text)
+                    if accumulator:
+                        accumulator.add_transcript(speaker="AGENT", message=resp_text)
+                    asyncio.create_task(
+                        broadcast_speech_and_data(resp_text, tool_invocation=tool_name)
+                    )
+                    return
+
+            # Execute conversational turn via LLM with bounded retries and 429 quota protection
+            asyncio.create_task(handle_llm_turn_with_circuit_breaker(text))
         except Exception as data_err:
             logger.error("Error handling data packet from participant: %s", data_err)
 
@@ -324,7 +463,7 @@ async def entrypoint(ctx: JobContext) -> None:
             message=greeting,
             timestamp_offset_ms=0,
         )
-    await session.say(greeting)
+    await broadcast_speech_and_data(greeting)
 
 
 def main() -> None:
@@ -366,4 +505,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

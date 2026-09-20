@@ -57,6 +57,8 @@ class AgentRuntimeConfig(BaseModel):
     tools_config: Any = Field(default_factory=dict, validation_alias="toolsConfig")
     business_hours: Optional[Any] = Field(default=None, validation_alias="businessHours")
     transfer_rules: Any = Field(default_factory=dict, validation_alias="transferRules")
+    clinic_profile: Optional[dict[str, Any]] = Field(default=None, validation_alias="clinicProfile")
+    knowledge_base: list[dict[str, Any]] = Field(default_factory=list, validation_alias="knowledgeBase")
 
 
 class CallTranscriptItem(BaseModel):
@@ -482,3 +484,127 @@ class RuntimeConfigClient:
             raise RuntimeClientConnectionError(
                 f"Failed to report call session to control plane at {self.base_url}: {net_err}"
             ) from net_err
+
+    async def check_availability(
+        self,
+        tenant_id: str,
+        date: str,
+        service_name: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Queries authoritative clinic appointment availability from control plane."""
+        if not tenant_id or not tenant_id.strip():
+            raise RuntimeClientValidationError("tenant_id must be non-empty")
+        if not date or not date.strip():
+            raise RuntimeClientValidationError("date must be non-empty")
+        if not self.worker_api_secret:
+            raise RuntimeClientAuthError("Worker API secret is not configured")
+
+        url = f"{self.base_url}/api/internal/clinic/availability"
+        payload: dict[str, Any] = {
+            "tenantId": tenant_id.strip(),
+            "date": date.strip(),
+        }
+        if service_name and service_name.strip():
+            payload["serviceName"] = service_name.strip()
+
+        headers = {
+            "Authorization": f"Bearer {self.worker_api_secret}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload, headers=headers) as resp:
+                    if resp.status == 200:
+                        body = await resp.json()
+                        if not body.get("success") or "data" not in body:
+                            msg = body.get("error", {}).get("message", "Malformed response from availability API")
+                            raise RuntimeClientValidationError(msg)
+                        return body["data"]
+
+                    if resp.status == 401:
+                        raise RuntimeClientAuthError("Control plane rejected worker API secret (401 Unauthorized)")
+                    if resp.status == 404:
+                        raise RuntimeClientNotFoundError(f"Tenant {tenant_id} not found (404)")
+                    if resp.status in (400, 403):
+                        body = await resp.json()
+                        raise RuntimeClientValidationError(body.get("error", {}).get("message", "Invalid availability request"))
+
+                    raise RuntimeClientConnectionError(f"Availability API returned status {resp.status}")
+        except (RuntimeClientError,):
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as net_err:
+            raise RuntimeClientConnectionError(f"Failed to reach availability API at {self.base_url}: {net_err}") from net_err
+
+    async def book_appointment(
+        self,
+        tenant_id: str,
+        patient_name: str,
+        phone: str,
+        date: str,
+        time: str,
+        service_name: str = "General Consultation",
+        notes: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        call_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Books an appointment in the control plane database with double-booking prevention."""
+        if not tenant_id or not tenant_id.strip():
+            raise RuntimeClientValidationError("tenant_id must be non-empty")
+        if not self.worker_api_secret:
+            raise RuntimeClientAuthError("Worker API secret is not configured")
+
+        url = f"{self.base_url}/api/internal/clinic/book"
+        payload: dict[str, Any] = {
+            "tenantId": tenant_id.strip(),
+            "patientName": patient_name.strip(),
+            "phone": phone.strip(),
+            "date": date.strip(),
+            "time": time.strip(),
+            "serviceName": service_name.strip(),
+        }
+        if notes:
+            payload["notes"] = notes.strip()
+        if agent_id:
+            payload["agentId"] = agent_id.strip()
+        if call_id:
+            payload["callId"] = call_id.strip()
+
+        headers = {
+            "Authorization": f"Bearer {self.worker_api_secret}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload, headers=headers) as resp:
+                    if resp.status == 200:
+                        body = await resp.json()
+                        if not body.get("success") or "data" not in body:
+                            msg = body.get("error", {}).get("message", "Malformed response from booking API")
+                            raise RuntimeClientValidationError(msg)
+                        return body["data"]
+
+                    if resp.status == 409:
+                        body = await resp.json()
+                        err_msg = body.get("error", {}).get("message", "Requested time slot is already booked")
+                        raise RuntimeClientValidationError(err_msg)
+
+                    if resp.status == 401:
+                        raise RuntimeClientAuthError("Control plane rejected worker API secret (401 Unauthorized)")
+                    if resp.status == 404:
+                        raise RuntimeClientNotFoundError(f"Tenant {tenant_id} not found (404)")
+                    if resp.status in (400, 403):
+                        body = await resp.json()
+                        err_msg = body.get("error", {}).get("message", "Bad request to booking API")
+                        raise RuntimeClientValidationError(err_msg)
+
+                    raise RuntimeClientConnectionError(f"Booking API returned status {resp.status}")
+        except (RuntimeClientError,):
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as net_err:
+            raise RuntimeClientConnectionError(f"Failed to reach booking API at {self.base_url}: {net_err}") from net_err
