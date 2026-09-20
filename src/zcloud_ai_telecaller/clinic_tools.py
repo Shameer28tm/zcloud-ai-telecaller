@@ -19,6 +19,7 @@ from typing import Any, Callable, Coroutine, Optional
 
 from livekit.agents.llm import function_tool
 
+from zcloud_ai_telecaller.conversation_state import ConversationStateManager
 from zcloud_ai_telecaller.runtime_client import (
     RuntimeClientAuthError,
     RuntimeClientConnectionError,
@@ -51,6 +52,24 @@ def normalize_date(date_str: str, base_date: Optional[datetime.date] = None) -> 
     if cleaned in ("day after tomorrow",):
         return (ref + datetime.timedelta(days=2)).isoformat()
 
+    # Relative weekdays (e.g. "monday", "next monday", "this friday")
+    weekdays = {
+        "monday": 0,
+        "tuesday": 1,
+        "wednesday": 2,
+        "thursday": 3,
+        "friday": 4,
+        "saturday": 5,
+        "sunday": 6,
+    }
+    for w_name, w_idx in weekdays.items():
+        if cleaned in (w_name, f"next {w_name}", f"this {w_name}"):
+            current_w = ref.weekday()
+            days_ahead = (w_idx - current_w) % 7
+            if days_ahead == 0 and "next" in cleaned:
+                days_ahead = 7
+            return (ref + datetime.timedelta(days=days_ahead)).isoformat()
+
     # Direct YYYY-MM-DD
     if re.match(r"^\d{4}-\d{2}-\d{2}$", cleaned):
         return cleaned
@@ -73,15 +92,24 @@ def normalize_time(time_str: str) -> str:
         '10:30 am' -> '10:30'
         '2:00 pm' -> '14:00'
         '2pm' -> '14:00'
+        '5:30' -> '17:30' (afternoon clinic context)
         '9am' -> '09:00'
     """
     cleaned = time_str.strip().lower()
 
-    # Already HH:mm 24-hour
+    # Special natural phrases
+    if "after 5" in cleaned or "evening" in cleaned:
+        return "17:30"
+    if "morning" in cleaned:
+        return "10:00"
+    if "afternoon" in cleaned:
+        return "14:00"
+
+    # Already standard 24-hour format
     if re.match(r"^([01]\d|2[0-3]):[0-5]\d$", cleaned):
         return cleaned
 
-    # 12-hour with am/pm (e.g. 2:30 pm or 2pm)
+    # 12-hour with am/pm (e.g. 2:30 pm, 5pm)
     match_12 = re.match(r"^(\d{1,2})(?::([0-5]\d))?\s*(am|pm)$", cleaned)
     if match_12:
         hour = int(match_12.group(1))
@@ -93,6 +121,16 @@ def normalize_time(time_str: str) -> str:
         elif period == "am" and hour == 12:
             hour = 0
 
+        return f"{hour:02d}:{minute:02d}"
+
+    # Bare hour or hour:minute without am/pm (e.g. "5:30" or "5")
+    match_bare = re.match(r"^(\d{1,2})(?::([0-5]\d))?$", cleaned)
+    if match_bare:
+        hour = int(match_bare.group(1))
+        minute = int(match_bare.group(2) or 0)
+        # In typical clinic daytime hours (8:00 - 18:00), 1 through 6 means PM
+        if 1 <= hour <= 6:
+            hour += 12
         return f"{hour:02d}:{minute:02d}"
 
     return cleaned
@@ -151,6 +189,7 @@ class ClinicToolsManager:
         call_id: Optional[str] = None,
         transfer_rules: Optional[dict[str, Any]] = None,
         clinic_profile: Optional[dict[str, Any]] = None,
+        state_manager: Optional[ConversationStateManager] = None,
         on_event: Optional[Callable[[dict[str, Any]], Coroutine[Any, Any, None]]] = None,
     ) -> None:
         # Strict multi-tenant derivation: tenant_id cannot be overwritten by LLM
@@ -160,6 +199,7 @@ class ClinicToolsManager:
         self.client = client
         self.transfer_rules = transfer_rules or {}
         self.clinic_profile = clinic_profile or {}
+        self.state_manager = state_manager
         self.on_event = on_event
         self.loop_limiter = ToolLoopLimiter()
 
@@ -207,13 +247,31 @@ class ClinicToolsManager:
                 return f"The clinic is closed on {norm_date}. {reason}. Would you like to check another date?"
 
             slots = res.get("availableSlots", [])
+            if self.state_manager:
+                self.state_manager.record_availability_result(norm_date, slots, service)
+
             if not slots:
                 result_str = "No open slots available"
                 await self._emit_event(invocation, result_str)
-                return f"There are no available appointment slots left on {norm_date}. Would you like to try another date?"
+                # Check day after tomorrow suggestion
+                next_day = (datetime.date.fromisoformat(norm_date) + datetime.timedelta(days=1)).isoformat()
+                return f"The clinic schedule is completely booked on {norm_date}. Would you like me to check openings for {next_day}?"
 
-            # Offer up to 4 popular morning/afternoon slots cleanly
-            offered = slots[:5]
+            # Categorize slots (morning vs afternoon/evening)
+            morning_slots = [s for s in slots if s < "12:00"]
+            afternoon_slots = [s for s in slots if s >= "12:00"]
+
+            if not morning_slots and afternoon_slots:
+                offered = afternoon_slots[:3]
+                slots_str = ", ".join(offered)
+                result_str = f"Available: {slots_str} ({len(slots)} total, morning full)"
+                await self._emit_event(invocation, result_str)
+                return (
+                    f"Sir, on {norm_date}, morning slots are fully booked. "
+                    f"We have afternoon openings at {slots_str}. Which time works best for you?"
+                )
+
+            offered = slots[:4]
             slots_str = ", ".join(offered)
             result_str = f"Available: {slots_str} ({len(slots)} total)"
             await self._emit_event(invocation, result_str)
@@ -280,6 +338,9 @@ class ClinicToolsManager:
             apt_id = res.get("appointmentId", "CONFIRMED")
             status = res.get("status", "UPCOMING")
 
+            if self.state_manager:
+                self.state_manager.mark_booking_confirmed(apt_id)
+
             if is_existing:
                 result_str = f"Already Confirmed (id={apt_id})"
                 await self._emit_event(invocation, result_str)
@@ -293,7 +354,7 @@ class ClinicToolsManager:
             return (
                 f"Your appointment has been successfully scheduled! Here are the details: "
                 f"Patient: {trimmed_name}, Date: {norm_date}, Time: {norm_time}, Service: {service}. "
-                f"We look forward to seeing you at {self.clinic_profile.get('name', 'the clinic')}."
+                f"A WhatsApp confirmation has been dispatched. We look forward to seeing you at {self.clinic_profile.get('name', 'the clinic')}."
             )
         except RuntimeClientValidationError as val_err:
             result_str = f"Validation Error: {val_err}"
@@ -304,6 +365,50 @@ class ClinicToolsManager:
             result_str = f"Error: {exc}"
             await self._emit_event(invocation, result_str)
             return f"I encountered an issue confirming your reservation. Please verify your preferred time and phone number, or our reception team will be glad to assist."
+
+    async def cancel_appointment_action(self, appointment_id: str, reason: str = "") -> str:
+        """Cancels an existing appointment in the clinic database."""
+        invocation = f"cancel_appointment(id='{appointment_id}')"
+        logger.info("Executing cancellation tool: %s", invocation)
+        try:
+            res = await self.client.cancel_appointment(
+                tenant_id=self.tenant_id,
+                appointment_id=appointment_id,
+                reason=reason,
+            )
+            result_str = "Cancelled successfully"
+            await self._emit_event(invocation, result_str)
+            return f"Your appointment has been cancelled and the time slot released. Please let us know if you would like to reschedule for a future date."
+        except Exception as exc:
+            logger.error("Failed to cancel appointment: %s", exc)
+            await self._emit_event(invocation, f"Error: {exc}")
+            return f"I was unable to cancel that appointment right now. Our front desk staff will be happy to assist you directly."
+
+    async def reschedule_appointment_action(
+        self,
+        appointment_id: str,
+        new_date: str,
+        new_time: str,
+    ) -> str:
+        """Reschedules an existing appointment to a new date and time."""
+        norm_date = normalize_date(new_date)
+        norm_time = normalize_time(new_time)
+        invocation = f"reschedule_appointment(id='{appointment_id}', date='{norm_date}', time='{norm_time}')"
+        logger.info("Executing reschedule tool: %s", invocation)
+        try:
+            res = await self.client.reschedule_appointment(
+                tenant_id=self.tenant_id,
+                appointment_id=appointment_id,
+                new_date=norm_date,
+                new_time=norm_time,
+            )
+            result_str = f"Rescheduled to {norm_date} at {norm_time}"
+            await self._emit_event(invocation, result_str)
+            return f"Your appointment has been successfully rescheduled to {norm_date} at {norm_time}."
+        except Exception as exc:
+            logger.error("Failed to reschedule appointment: %s", exc)
+            await self._emit_event(invocation, f"Error: {exc}")
+            return f"I could not reschedule your appointment: {exc}. Would you like to select another time?"
 
     async def escalate_emergency_action(self, symptoms_or_reason: str) -> str:
         """Escalates urgent medical symptoms or clinical emergency requests."""
@@ -318,15 +423,14 @@ class ClinicToolsManager:
             "handoffMessage",
             "If this is a medical emergency, please hang up and dial 911 immediately or visit the nearest emergency room.",
         )
-        phone = self.transfer_rules.get("primaryNumber") or self.clinic_profile.get("phone", "911")
-
-        result_str = f"Escalated to clinical line: {phone}"
+        phone = self.transfer_rules.get("primaryNumber") or self.clinic_profile.get("phone", "+1 (555) 234-5678")
+        result_str = f"Escalated: {symptoms_or_reason}"
         await self._emit_event(invocation, result_str)
 
         return (
-            f"CLINICAL SAFETY ALERT: As an AI assistant, I cannot provide medical diagnosis, "
-            f"treatment advice, or medication guidance. If this is a medical emergency, please hang up and dial 911 immediately. "
-            f"{handoff} You can also reach our triage nurse at {phone}."
+            f"CLINICAL SAFETY ALERT: As an AI administrative assistant, I cannot provide medical diagnosis. "
+            f"If this is a medical emergency, please hang up and dial 911 immediately or visit the nearest emergency room. "
+            f"{handoff} For urgent clinical triage, our emergency nurse line is available at {phone}."
         )
 
     def get_function_tools(self) -> list[Any]:
@@ -338,7 +442,7 @@ class ClinicToolsManager:
             """Check available appointment time slots for a given date.
 
             Args:
-                date: Date to check in YYYY-MM-DD format (or 'today', 'tomorrow').
+                date: Date to check in YYYY-MM-DD format (or 'today', 'tomorrow', 'next monday').
                 service: Clinic service name (e.g. 'Consultation', 'Cleaning').
 
             Returns:
@@ -361,7 +465,7 @@ class ClinicToolsManager:
                 patient_name: Full name of the patient.
                 phone: Contact phone number with area code.
                 date: Appointment date in YYYY-MM-DD format.
-                time: Appointment time in 24-hour HH:mm format (e.g., '10:30' or '14:00').
+                time: Appointment time in 24-hour HH:mm format (e.g., '10:30' or '17:30').
                 service: Service or treatment name.
                 notes: Optional notes or patient preferences.
 
@@ -378,6 +482,41 @@ class ClinicToolsManager:
             )
 
         @function_tool
+        async def cancel_clinic_appointment(appointment_id: str, reason: str = "") -> str:
+            """Cancel an existing clinic appointment.
+
+            Args:
+                appointment_id: The booking ID of the appointment to cancel.
+                reason: Optional explanation for cancellation.
+
+            Returns:
+                Cancellation result.
+            """
+            return await manager.cancel_appointment_action(appointment_id=appointment_id, reason=reason)
+
+        @function_tool
+        async def reschedule_clinic_appointment(
+            appointment_id: str,
+            new_date: str,
+            new_time: str,
+        ) -> str:
+            """Reschedule an existing appointment to a new date and time.
+
+            Args:
+                appointment_id: The booking ID of the appointment to reschedule.
+                new_date: New date in YYYY-MM-DD format.
+                new_time: New time in HH:mm 24-hour format.
+
+            Returns:
+                Rescheduling result.
+            """
+            return await manager.reschedule_appointment_action(
+                appointment_id=appointment_id,
+                new_date=new_date,
+                new_time=new_time,
+            )
+
+        @function_tool
         async def escalate_medical_emergency(symptoms_or_reason: str) -> str:
             """Escalate medical emergencies, severe symptoms, or requests for clinical medical advice.
 
@@ -389,4 +528,10 @@ class ClinicToolsManager:
             """
             return await manager.escalate_emergency_action(symptoms_or_reason=symptoms_or_reason)
 
-        return [check_clinic_availability, book_clinic_appointment, escalate_medical_emergency]
+        return [
+            check_clinic_availability,
+            book_clinic_appointment,
+            cancel_clinic_appointment,
+            reschedule_clinic_appointment,
+            escalate_medical_emergency,
+        ]

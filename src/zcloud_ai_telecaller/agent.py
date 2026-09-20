@@ -29,6 +29,7 @@ from livekit.plugins import google, silero
 
 from zcloud_ai_telecaller.clinic_tools import ClinicToolsManager
 from zcloud_ai_telecaller.config import Settings, get_settings
+from zcloud_ai_telecaller.conversation_state import ConversationStateManager
 from zcloud_ai_telecaller.local_stt import FasterWhisperSTT
 from zcloud_ai_telecaller.local_tts import PiperTTS
 from zcloud_ai_telecaller.logging_config import setup_logging
@@ -36,6 +37,7 @@ from zcloud_ai_telecaller.prompt_builder import (
     build_clinic_system_prompt,
     match_deterministic_clinic_query,
 )
+from zcloud_ai_telecaller.rule_engine import BusinessRuleEngine
 from zcloud_ai_telecaller.runtime_client import (
     AgentRuntimeConfig,
     CallSessionAccumulator,
@@ -159,6 +161,8 @@ async def entrypoint(ctx: JobContext) -> None:
     client: Optional[RuntimeConfigClient] = None
     accumulator: Optional[CallSessionAccumulator] = None
     runtime_config: Optional[AgentRuntimeConfig] = None
+    state_manager: Optional[ConversationStateManager] = None
+    rule_engine: Optional[BusinessRuleEngine] = None
     tools_manager: Optional[ClinicToolsManager] = None
     function_tools: list[Any] = []
 
@@ -212,6 +216,22 @@ async def entrypoint(ctx: JobContext) -> None:
             if runtime_config.voice_id:
                 piper_voice = runtime_config.voice_id
 
+            # Initialize structured conversation state and business rule engine
+            max_ctx = 10
+            max_out = 250
+            if runtime_config.business_rules:
+                policy = runtime_config.business_rules.get("conversationPolicy", {})
+                max_ctx = policy.get("maxContextMessages", 10)
+                max_out = policy.get("maxOutputTokens", 250)
+
+            state_manager = ConversationStateManager(
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                max_context_messages=max_ctx,
+                max_output_tokens=max_out,
+            )
+            rule_engine = BusinessRuleEngine(runtime_config.business_rules)
+
             # Initialize authoritative call session accumulator for billing & transcripts
             accumulator = CallSessionAccumulator(
                 tenant_id=tenant_id,
@@ -229,6 +249,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 client=client,
                 transfer_rules=runtime_config.transfer_rules if isinstance(runtime_config.transfer_rules, dict) else {},
                 clinic_profile=runtime_config.clinic_profile or {},
+                state_manager=state_manager,
                 on_event=broadcast_data_packet,
             )
             function_tools = tools_manager.get_function_tools()
@@ -331,7 +352,26 @@ async def entrypoint(ctx: JobContext) -> None:
         await session.say(message)
 
     async def handle_llm_turn_with_circuit_breaker(user_input: str) -> None:
-        """Executes LLM reply generation with bounded retries and graceful 429 quota handling."""
+        """Executes LLM reply generation with pre-turn rule evaluation and bounded retries."""
+        if state_manager:
+            state_manager.add_message("user", user_input)
+
+        if rule_engine:
+            clinic_ph = (
+                runtime_config.clinic_profile.get("phone", "+1 (555) 234-5678")
+                if runtime_config and runtime_config.clinic_profile
+                else "+1 (555) 234-5678"
+            )
+            pre_eval = rule_engine.evaluate_pre_turn(user_input, clinic_phone=clinic_ph)
+            if pre_eval.is_blocking and pre_eval.message:
+                logger.info("Pre-turn rule evaluation triggered action '%s': %s", pre_eval.action, pre_eval.reason)
+                if accumulator:
+                    accumulator.add_transcript(speaker="AGENT", message=pre_eval.message)
+                if state_manager:
+                    state_manager.add_message("assistant", pre_eval.message)
+                await broadcast_speech_and_data(pre_eval.message, tool_invocation=pre_eval.tool_name)
+                return
+
         if tools_manager:
             tools_manager.loop_limiter.reset_turn()
 
@@ -410,6 +450,13 @@ async def entrypoint(ctx: JobContext) -> None:
             if not text:
                 return
             logger.info("Received query from participant '%s': %s", getattr(dp.participant, "identity", "unknown"), text)
+
+            # Barge-in / Interruption: cancel any currently playing agent speech immediately
+            try:
+                session.interrupt(force=True)
+            except Exception as int_err:
+                logger.debug("Barge-in interrupt triggered: %s", int_err)
+
             if accumulator:
                 accumulator.add_transcript(speaker="CUSTOMER", message=text)
 
@@ -435,6 +482,21 @@ async def entrypoint(ctx: JobContext) -> None:
     def on_session_error(ev) -> None:
         err = getattr(ev, "error", ev)
         logger.error("Session error occurred in room %s: %s", ctx.room.name, err)
+        err_str = str(err).lower()
+        if "429" in err_str or "resource_exhausted" in err_str or "quota" in err_str:
+            logger.warning("Session caught 429 rate limit. Broadcasting fallback.")
+            clinic_phone = (
+                runtime_config.clinic_profile.get("phone", "+1 (555) 234-5678")
+                if runtime_config and runtime_config.clinic_profile
+                else "+1 (555) 234-5678"
+            )
+            fallback_msg = (
+                f"I apologize, our automated clinic assistant is experiencing unusually high call volume. "
+                f"Please hold for our front desk, or contact our reception directly at {clinic_phone}."
+            )
+            if accumulator:
+                accumulator.add_transcript(speaker="AGENT", message=fallback_msg)
+            asyncio.create_task(broadcast_speech_and_data(fallback_msg))
 
     @session.on("close")
     def on_session_close(ev) -> None:

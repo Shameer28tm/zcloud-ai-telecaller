@@ -55,6 +55,7 @@ class AgentRuntimeConfig(BaseModel):
     ai_model: str = Field(default="gemini-2.5-flash", validation_alias="aiModel")
     stt_provider: str = Field(default="faster-whisper", validation_alias="sttProvider")
     tools_config: Any = Field(default_factory=dict, validation_alias="toolsConfig")
+    business_rules: Optional[dict[str, Any]] = Field(default=None, validation_alias="businessRules")
     business_hours: Optional[Any] = Field(default=None, validation_alias="businessHours")
     transfer_rules: Any = Field(default_factory=dict, validation_alias="transferRules")
     clinic_profile: Optional[dict[str, Any]] = Field(default=None, validation_alias="clinicProfile")
@@ -608,3 +609,92 @@ class RuntimeConfigClient:
             raise
         except (aiohttp.ClientError, asyncio.TimeoutError) as net_err:
             raise RuntimeClientConnectionError(f"Failed to reach booking API at {self.base_url}: {net_err}") from net_err
+
+    async def cancel_appointment(
+        self,
+        tenant_id: str,
+        appointment_id: str,
+        reason: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Cancels an appointment in the control plane database and frees the slot."""
+        if not tenant_id or not tenant_id.strip():
+            raise RuntimeClientValidationError("tenant_id must be non-empty")
+        if not appointment_id or not appointment_id.strip():
+            raise RuntimeClientValidationError("appointment_id must be non-empty")
+        if not self.worker_api_secret:
+            raise RuntimeClientAuthError("Worker API secret is not configured")
+
+        url = f"{self.base_url}/api/internal/clinic/cancel"
+        payload = {
+            "tenantId": tenant_id.strip(),
+            "appointmentId": appointment_id.strip(),
+            "reason": (reason or "Customer requested cancellation").strip(),
+        }
+        headers = {
+            "Authorization": f"Bearer {self.worker_api_secret}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload, headers=headers) as resp:
+                    if resp.status == 200:
+                        body = await resp.json()
+                        return body.get("data", {})
+                    if resp.status == 401:
+                        raise RuntimeClientAuthError("Unauthorized cancel request")
+                    body = await resp.json()
+                    raise RuntimeClientValidationError(body.get("error", {}).get("message", "Cancel failed"))
+        except (RuntimeClientError,):
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as net_err:
+            raise RuntimeClientConnectionError(f"Failed to reach cancellation API: {net_err}") from net_err
+
+    async def reschedule_appointment(
+        self,
+        tenant_id: str,
+        appointment_id: str,
+        new_date: str,
+        new_time: str,
+    ) -> dict[str, Any]:
+        """Reschedules an appointment to a new open slot in the control plane database."""
+        if not tenant_id or not tenant_id.strip():
+            raise RuntimeClientValidationError("tenant_id must be non-empty")
+        if not appointment_id or not appointment_id.strip():
+            raise RuntimeClientValidationError("appointment_id must be non-empty")
+        if not self.worker_api_secret:
+            raise RuntimeClientAuthError("Worker API secret is not configured")
+
+        url = f"{self.base_url}/api/internal/clinic/reschedule"
+        payload = {
+            "tenantId": tenant_id.strip(),
+            "appointmentId": appointment_id.strip(),
+            "newDate": new_date.strip(),
+            "newTime": new_time.strip(),
+        }
+        headers = {
+            "Authorization": f"Bearer {self.worker_api_secret}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload, headers=headers) as resp:
+                    if resp.status == 200:
+                        body = await resp.json()
+                        return body.get("data", {})
+                    if resp.status == 409:
+                        body = await resp.json()
+                        raise RuntimeClientValidationError(body.get("error", {}).get("message", "Slot unavailable"))
+                    if resp.status == 401:
+                        raise RuntimeClientAuthError("Unauthorized reschedule request")
+                    body = await resp.json()
+                    raise RuntimeClientValidationError(body.get("error", {}).get("message", "Reschedule failed"))
+        except (RuntimeClientError,):
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as net_err:
+            raise RuntimeClientConnectionError(f"Failed to reach rescheduling API: {net_err}") from net_err

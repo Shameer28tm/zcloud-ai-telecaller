@@ -30,7 +30,7 @@ def format_business_hours(hours_cfg: Optional[dict[str, Any]]) -> str:
 
 
 def build_clinic_system_prompt(config: AgentRuntimeConfig) -> str:
-    """Builds a compact, high-efficiency system prompt embedding clinic facts and clinical safety rules."""
+    """Builds a compact, high-efficiency system prompt embedding clinic facts and business rules."""
     profile = config.clinic_profile or {}
     clinic_name = profile.get("name") or config.name or "Our Healthcare Clinic"
     clinic_phone = profile.get("phone") or "+1 (555) 234-5678"
@@ -73,13 +73,13 @@ CRITICAL AI SAFETY & CLINICAL RULES:
 2. ZERO MEDICAL ADVICE: You MUST NEVER diagnose illnesses, interpret medical symptoms or lab results, prescribe medications, or advise on dosage.
 3. MEDICAL EMERGENCY ESCALATION: If the caller mentions emergency symptoms (e.g. chest pain, heart attack, stroke signs, difficulty breathing, profuse bleeding, or severe trauma), immediately tell them to hang up and dial 911 (or local emergency services) or go to the nearest emergency room. Also call the escalate_medical_emergency tool.
 4. SAFE FALLBACK: If asked a question about clinic policies, fees, or medical records not listed above, say: "I do not have that specific information in my system, but our front desk staff can gladly assist you during operating hours at {clinic_phone}." Never invent or assume facts.
-
-EFFICIENCY & TOOL CALLING RULES:
-1. DETERMINISTIC FACTS: For questions about clinic hours, address, phone number, or general services, answer immediately using the profile above. Do NOT call tools for static information.
-2. AVAILABILITY CHECK: When a caller asks for an appointment or asks when the clinic is open, call check_clinic_availability(date="YYYY-MM-DD") to verify openings before booking.
-3. BOOKING: Once the patient agrees on a time slot and provides their full name, phone number, date, and time, invoke book_clinic_appointment.
-4. CONCISE VOICE RESPONSES: Keep all voice answers brief (1-3 sentences), warm, natural, and clear.
-5. MULTILINGUAL: If the caller speaks another language, respond politely in that language while keeping tool inputs standardized.
+5. BUSINESS RULES & TOOL CALLING:
+   - ZERO HALLUCINATION: Never invent or assume appointment availability. ALWAYS call check_clinic_availability to retrieve real openings before offering slots.
+   - CONFIRMATION REQUIRED: Asking about availability is NOT consent to book. If a caller asks "Is 5:30 PM open?", confirm its availability and ask "Would you like me to book that for you?". Only book once they explicitly agree and provide their name and phone number.
+   - NATURAL RECEPTIONIST FLOW: Speak concisely like a real clinic receptionist (1-2 sentences). Acknowledge checking the schedule politely ("Sure, let me check the calendar for you.").
+   - SUGGEST ALTERNATIVES: If a requested slot is booked or morning is full, explain what is open and suggest convenient alternatives from actual tool results.
+   - DETERMINISTIC FACTS: For questions about clinic hours, address, phone number, or general services, answer immediately using the profile above. Do NOT call tools for static information.
+   - CONCISE VOICE RESPONSES: Keep all voice answers brief (1-2 sentences), warm, natural, and clear.
 """
     return prompt.strip()
 
@@ -120,7 +120,7 @@ def match_deterministic_clinic_query(
     # 2. Operating Hours
     if re.search(r"\b(what time do you open|opening hours|business hours|closing time|what are your hours|when are you open|are you open today|what days are you open)\b", q):
         return (
-            f"Apex Dental Care hours are {hours_summary}. How can I assist you with your visit?",
+            f"{clinic_name} hours are {hours_summary}. How can I assist you with your visit?",
             None,
         )
 
@@ -138,17 +138,12 @@ def match_deterministic_clinic_query(
             None,
         )
 
-    # 5. Services List
-    if re.search(r"\b(what services do you offer|what services do you have|list your services|what treatments do you provide|services provided)\b", q):
-        services = profile.get("services") or [
-            "Routine Consultation",
-            "Dental Cleaning & Checkup",
-            "Preventive Care",
-            "Follow-up Visits",
-        ]
+    # 5. Clinic Services
+    if re.search(r"\b(what services|services do you offer|what treatments|services available|what do you do)\b", q):
+        services = profile.get("services") or ["Routine Consultation", "Dental Cleaning"]
         services_str = ", ".join(services)
         return (
-            f"{clinic_name} provides {services_str}. Would you like to schedule an appointment for any of these?",
+            f"{clinic_name} offers the following services: {services_str}. Would you like to schedule an appointment for any of these?",
             None,
         )
 
