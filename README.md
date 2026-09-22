@@ -1,207 +1,234 @@
-# Z Cloud AI Telecaller
+# Z Cloud AI Telecaller — Production Multi-Tenant AI Voice SaaS
 
-Z Cloud AI Telecaller is a real-time conversational AI telecalling platform built on top of [LiveKit Agents](https://docs.livekit.io/agents/).
+Z Cloud AI Telecaller is a production-grade conversational AI voice telecalling SaaS built on [LiveKit Agents](https://docs.livekit.io/agents/), featuring dynamic multi-tenant agent management, multi-provider LLM abstraction (local Ollama, Google Gemini, and Hybrid fallback), deterministic clinic business tools, conversational intelligence, authoritative usage metering, and strict tenant isolation.
 
-## Phase 1 Architecture & Voice Pipeline
+---
 
-The Phase 1 foundation establishes a low-latency WebRTC audio streaming pipeline connecting browser clients with LiveKit and autonomous AI agent workers running at **₹0 API cost for STT and TTS**:
-
-```text
-Browser / WebRTC  <--->  LiveKit Server  <--->  AI Agent Worker
-                                                   |
-                     +-----------------------------+-----------------------------+
-                     |                             |                             |
-                     v                             v                             v
-           Silero VAD / Faster-Whisper       Gemini 2.5 Flash               Piper Neural TTS
-           (Speech-to-Text & VAD, ₹0)     (Language Intelligence)          (Text-to-Speech, ₹0)
-```
-
-- **VAD**: Silero VAD (`livekit-plugins-silero`)
-- **STT**: Local `faster-whisper` (CTranslate2) wrapped with LiveKit `StreamAdapter`
-- **LLM**: Google Gemini 2.5 Flash (`livekit-plugins-google`)
-- **TTS**: Local `piper-tts` neural voice synthesis
-- **Transport**: LiveKit WebRTC audio streaming
-
-## Phase 2A: Control Plane -> Python Worker Integration
-
-In Phase 2A, the hardcoded instructions and greeting are replaced with dynamic, multi-tenant runtime configuration fetched from the Next.js Control Plane (`LIVEKIT-AGENT-`):
+## 🏗️ High-Level System Architecture
 
 ```text
-Dashboard (Agent Editor)
-         ↓
-Published AgentVersion
-         ↓
-Control Plane Internal API  (GET /api/internal/agent-runtime with WORKER_API_SECRET)
-         ↓
-Python LiveKit Worker
-         ↓
-LiveKit Participant Metadata (tenantId, agentId, agentVersionId)
-         ↓
-Dynamic Agent Prompt & Greeting Injection
-         ↓
-Gemini 2.5 Flash Voice Session
+       ┌─────────────────────────────────────────────────────────┐
+       │             PUBLIC WEB CLIENT / BROWSER                 │
+       └──────────────────────────┬──────────────────────────────┘
+                                  │ WebRTC Audio
+                                  ▼
+       ┌─────────────────────────────────────────────────────────┐
+       │                      LIVEKIT SERVER                     │
+       └──────────────────────────┬──────────────────────────────┘
+                                  │ Room Dispatch
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          PYTHON VOICE WORKER                            │
+│                                                                         │
+│   ┌─────────────────────────────────────────────────────────────────┐   │
+│   │                      VOICE PIPELINE ENGINE                      │   │
+│   │                                                                 │   │
+│   │  Silero VAD  ──>  Faster-Whisper STT  ──>  Rule Engine & State  │   │
+│   │                                                    │            │   │
+│   │                                                    ▼            │   │
+│   │  Local Piper TTS  <──  Streaming Thinking Filter  <──  LLM      │   │
+│   └───────────────────────────────────┬─────────────────────────────┘   │
+│                                       │                                 │
+│                                       ▼                                 │
+│                ┌───────────────────────────────────────┐                │
+│                │        LLM PROVIDER ABSTRACTION       │                │
+│                │                                       │                │
+│                │  ├── LOCAL_AI:  Ollama (qwen3:4b)     │                │
+│                │  ├── CLOUD_AI:  Google Gemini Flash   │                │
+│                │  └── HYBRID:    Ollama ──> Gemini     │                │
+│                └──────────────────────┬────────────────┘                │
+│                                       │ Validated Tool Calls            │
+│                                       ▼                                 │
+│                ┌───────────────────────────────────────┐                │
+│                │     CLINIC TOOLS & BUSINESS RULES     │                │
+│                │                                       │                │
+│                │  - Check Availability                 │                │
+│                │  - Book Appointment (Atomic Lock)     │                │
+│                │  - Cancel / Reschedule                │                │
+│                │  - Emergency 911 Escalation           │                │
+│                │  - Medical Advice Prohibition         │                │
+│                └──────────────────────┬────────────────┘                │
+│                                       │ M2M Authenticated JSON          │
+└───────────────────────────────────────┼─────────────────────────────────┘
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   CONTROL PLANE / SAAS (NEXT.JS)                        │
+│                                                                         │
+│   GET  /api/internal/agent-runtime   ──> Dynamic agent config & prompt  │
+│   POST /api/internal/clinic/*        ──> Atomic DB transactions         │
+│   POST /api/internal/call-session    ──> Authoritative usage & metering │
+│                                                                         │
+│   Database: SQLite / PostgreSQL (Prisma ORM)                            │
+│   Multi-Tenant Isolation: Tenant-scoped queries, 0 client-side trust    │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-Key guarantees:
-- **Zero Exposed Secrets**: Machine-to-machine authentication via `Authorization: Bearer <WORKER_API_SECRET>`. The API strips internal secrets before sending.
-- **Strict Multi-Tenant Isolation**: Tenant IDs and agent IDs are strictly cross-verified; cross-tenant attempts return `404 Not Found`.
-- **Published Version Enforcement**: Unpublished draft versions are rejected (`400 VERSION_UNPUBLISHED`).
-- **Safe Session Abort**: If metadata or version verification fails, the worker aborts the session immediately without falling back to cross-tenant or unauthenticated data.
+---
 
-## Project Structure
+## 🌟 Operating Modes (LOCAL_AI, CLOUD_AI, HYBRID)
 
-```text
-zcloud-ai-telecaller/
-├── .env.example                 # Environment variable templates
-├── .gitignore                   # Git ignore configurations (protects secrets, venv, caches)
-├── .dockerignore                # Docker ignore rules
-├── Dockerfile                   # Production-ready Docker container specification
-├── pyproject.toml               # Project metadata and dependencies (managed via uv)
-├── uv.lock                      # Deterministic dependency lockfile
-├── README.md                    # Project documentation
-├── src/
-│   └── zcloud_ai_telecaller/
-│       ├── __init__.py          # Package root exports
-│       ├── agent.py             # LiveKit Agent entry point and voice pipeline configuration
-│       ├── config.py            # Pydantic Settings configuration management
-│       ├── local_stt.py         # Local faster-whisper STT implementation (LiveKit STT)
-│       ├── local_tts.py         # Local Piper TTS implementation (LiveKit TTS)
-│       ├── logging_config.py    # Structured logging configuration
-│       └── runtime_client.py    # Control plane dynamic runtime configuration client
-└── tests/
-    ├── __init__.py
-    ├── test_agent.py            # Agent, local STT/TTS pipeline, and lifecycle tests
-    ├── test_config.py           # Configuration and environment tests
-    ├── test_logging.py          # Logging setup tests
-    └── test_runtime_client.py   # Phase 2A runtime client and prompt injection tests
-```
+The platform supports 3 primary operating modes configurable per tenant/agent or globally via environment variables:
 
-## Getting Started
+| Mode | STT | LLM | TTS | API Cost | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **`LOCAL_AI`** | `faster-whisper` (int8) | **Ollama** (`qwen3:4b`) | `Piper` (neural) | **₹0.00** | 100% local, self-hosted, CPU-compatible voice telecaller without any third-party API dependencies. |
+| **`CLOUD_AI`** | `faster-whisper` | **Gemini 2.5 Flash** | `Piper` | Low Cloud | Cloud LLM inference via Google Gemini for complex reasoning and large context windows. |
+| **`HYBRID`** | `faster-whisper` | **Ollama ➔ Gemini** | `Piper` | Minimal | Primary requests run locally via Ollama at ₹0; automatically falls back to Gemini if Ollama times out or is unreachable. |
 
-### Prerequisites
+### Thinking Tag Filter (`<think>...</think>`)
+Reasoning models like Qwen 3 emit internal thought blocks wrapped in `<think>...</think>`. The worker implements an asynchronous streaming `OllamaThinkingFilter` that intercepts and discards thinking tokens in real-time, preventing internal reasoning from ever leaking to Piper TTS or call transcripts.
+
+---
+
+## 🩺 Phase 3 Clinic AI Capabilities
+
+The clinic AI capability provides deterministic, safety-enforced receptionist services:
+1. **Clinic Information**: Operating hours, address, services, and policies configured per tenant.
+2. **Deterministic Availability**: Real-time lookup of available appointment slots directly from the database.
+3. **Double-Booking Prevention**: Database transactions and concurrency locks ensure conflicting bookings are rejected (`409 Conflict`).
+4. **Rescheduling & Cancellations**: Securely frees previously reserved time slots.
+5. **Human Escalation**: Clean boundary for customer service or staff transfers.
+
+---
+
+## 🛡️ Phase 4 Conversational Intelligence & Clinical Safety
+
+A deterministic 7-priority rule engine evaluates user turns before routing to the LLM:
+1. **Emergency Detection (Priority 1)**: Severe medical symptoms (chest pain, shortness of breath, heavy bleeding) immediately trigger emergency escalation to call 911 or visit the nearest emergency room.
+2. **Prompt Injection Defense (Priority 2)**: Detects and blocks jailbreak phrases and attempts to bypass system instructions.
+3. **Medical Advice Prohibition (Priority 3)**: Strictly refuses requests for diagnosis, medication prescriptions, or treatment advice:
+   > *"As an administrative voice assistant, I cannot diagnose medical conditions or prescribe medications. I would be glad to schedule an in-person consultation..."*
+4. **Booking Confirmation Gate (Priority 4)**: Explicit user confirmation is required before booking; asking about availability does not trigger booking.
+5. **Response Sanitization**: Trims long responses and redacts API keys, bearer tokens, or sensitive credentials.
+
+---
+
+## 📊 Authoritative Call Persistence & Metering (Phase 2B)
+
+- Every call session records room metadata, start/end timestamps, duration, and full conversation transcripts.
+- **Server-Authoritative Metering**: Voice minutes are calculated server-side as `ceil(durationSeconds / 60)`.
+- **Strict Idempotency**: Duplicate session reports from network retries safely return existing records without double-charging usage.
+
+---
+
+## 🚀 Getting Started
+
+### 1. Prerequisites
 
 - Python `>= 3.12`
-- [uv](https://docs.astral.sh/uv/) package manager
-- LiveKit Cloud account (or self-hosted LiveKit Server)
-- Google Gemini API Key (for LLM reasoning & responses)
-- **Zero OpenAI API Key required** (STT and TTS run locally at ₹0 cost)
+- Node.js `>= 18.0.0`
+- [Ollama](https://ollama.com/) (for `LOCAL_AI` or `HYBRID` mode)
+- LiveKit Cloud account or local LiveKit Server
 
-### 1. Install Dependencies
+### 2. Setup Ollama (Local AI)
 
-Install all project dependencies into the virtual environment using `uv`:
+1. Install Ollama from [ollama.com](https://ollama.com/).
+2. Pull the recommended local model:
+   ```bash
+   ollama run qwen3:4b
+   ```
+3. Verify Ollama is running:
+   ```bash
+   curl http://127.0.0.1:11434/api/tags
+   ```
+
+### 3. Setup Next.js Control Plane
 
 ```bash
-uv sync
+cd LIVEKIT-AGENT-
+npm install
+npx prisma generate
+npx prisma db push
+npm run build
+npm run dev
 ```
 
-### 2. Create and Configure `.env`
+The Control Plane dashboard will be available at `http://localhost:3000`.
 
-Copy the example environment file and populate your credentials:
+### 4. Setup Python Voice Worker
 
 ```bash
-cp .env.example .env
+cd ZCloud-AI-Telecaller
+python -m venv .venv
+# On Windows:
+.venv\Scripts\activate
+# On Linux/macOS:
+source .venv/bin/activate
+
+pip install -e .
 ```
 
-Edit `.env` with your actual credentials:
+Create a `.env` file in `ZCloud-AI-Telecaller`:
 
 ```ini
-# LiveKit Server Configuration (from LiveKit Cloud Dashboard -> Settings -> Keys)
+# LiveKit Server
 LIVEKIT_URL=wss://your-project.livekit.cloud
-LIVEKIT_API_KEY=APIxxxxxxxxxxxx
-LIVEKIT_API_SECRET=secxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+LIVEKIT_API_KEY=your_api_key
+LIVEKIT_API_SECRET=your_api_secret
 
-# Google Gemini API Key (for LLM reasoning & response generation)
-GEMINI_API_KEY=AIzaSyxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# AI Mode & Provider Configuration
+AI_MODE=LOCAL_AI
+LLM_PROVIDER=ollama
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=qwen3:4b
+OLLAMA_TIMEOUT=60.0
 
-# Local STT Settings (faster-whisper, ₹0 API cost)
+# Cloud Fallback (required for CLOUD_AI or HYBRID)
+GEMINI_API_KEY=your_gemini_api_key
+
+# Control Plane M2M Integration
+CONTROL_PLANE_URL=http://localhost:3000
+WORKER_API_SECRET=your_shared_worker_secret
+
+# Local STT & TTS (Zero Cost)
 WHISPER_MODEL_SIZE=base
 WHISPER_DEVICE=cpu
 WHISPER_COMPUTE_TYPE=int8
-
-# Local TTS Settings (Piper, ₹0 API cost)
 PIPER_VOICE=en_US-lessac-medium
-
-# Agent Worker Configuration
-AGENT_NAME=zcloud-ai-telecaller-agent
-AGENT_LOG_LEVEL=INFO
 ```
 
-### 3. Start the Agent Worker
-
-Start the agent worker locally in development mode:
-
+Run the worker:
 ```bash
-# Run in dev mode
-uv run python -m zcloud_ai_telecaller.agent dev
+python -m zcloud_ai_telecaller.agent dev
 ```
 
-Or run via the installed project script:
+---
 
+## 🧪 Verification & Test Suite
+
+The platform includes comprehensive test suites across both repositories:
+
+### Python Worker Tests (76 Tests)
 ```bash
-uv run zcloud-ai-telecaller
+cd ZCloud-AI-Telecaller
+pytest -v
 ```
+- `test_agent.py`: Agent lifecycle, VAD prewarming, local STT & TTS.
+- `test_config.py`: Environment validation, AI modes, zero-OpenAI guarantee.
+- `test_llm_provider.py`: Ollama streaming, thinking filter, tool calling, hybrid fallback.
+- `test_clinic_ai.py`: Appointment tools, date/time normalization, double-booking prevention.
+- `test_phase4_intelligence.py`: Emergency rules, prompt injection defense, medical refusal.
+- `test_runtime_client.py`: Control Plane integration, participant metadata extraction.
+- `test_e2e_voice_saas.py`: End-to-end multi-tenant isolation, billing metering, provider switching.
 
-Upon startup, the worker validates environment variables, pre-warms the Silero VAD model, connects to your LiveKit server, and logs:
-```text
-INFO | zcloud_ai_telecaller - Worker startup: Initializing Z Cloud AI Telecaller agent worker (agent=zcloud-ai-telecaller-agent)
-INFO | zcloud_ai_telecaller - Environment configuration validated successfully
-INFO | livekit.agents - starting worker
-INFO | livekit.agents - plugin registered {"plugin": "livekit.plugins.google", "version": "1.8.2"}
-INFO | livekit.agents - plugin registered {"plugin": "livekit.plugins.silero", "version": "1.8.2"}
-INFO | livekit.agents - registered worker {"agent_name": "zcloud-ai-telecaller-agent", "url": "wss://..."}
-```
-
-### 4. Connect a Browser Participant to LiveKit
-
-Once the agent worker is registered and listening for rooms:
-
-1. Open the [LiveKit Agents Playground](https://agents-playground.livekit.io/) in your browser (Google Chrome or Microsoft Edge recommended).
-2. Click **Settings** (gear icon) or **Connect** in the playground.
-3. Paste your:
-   - **LiveKit URL**: `wss://your-project.livekit.cloud`
-   - **Token**: Generate an access token via your LiveKit Cloud Dashboard (under **Sandbox** or **Token Generator**) or using the LiveKit CLI:
-     ```bash
-     # Generate token for room "telecaller-demo" with identity "browser-user"
-     lk token create --api-key <LIVEKIT_API_KEY> --api-secret <LIVEKIT_API_SECRET> --join --room telecaller-demo --identity browser-user
-     ```
-   *(Alternatively, if using LiveKit Cloud, navigate to **Sandbox** -> **Agents** and connect directly from the dashboard).*
-4. Allow browser microphone access when prompted.
-5. Click **Connect**.
-
-### 5. Test Voice Conversation
-
-When the browser participant connects:
-1. **Worker logs connection**:
-   ```text
-   INFO | zcloud_ai_telecaller - Connecting to LiveKit room: telecaller-demo
-   INFO | zcloud_ai_telecaller - Participant joined: identity=browser-user in room: telecaller-demo
-   INFO | zcloud_ai_telecaller - Voice session started for room: telecaller-demo
-   ```
-2. **Initial Greeting**: The agent speaks back over WebRTC via local Piper TTS:
-   > *"Hello! I am your Z Cloud AI Voice Assistant. How can I help you today?"*
-3. **Speak into microphone**: Say a test phrase, for example:
-   > *"Hi, can you introduce yourself?"*
-4. **Agent Response**: The agent will transcribe your speech via local `faster-whisper`, process it via Google Gemini 2.5 Flash adhering to the Phase 1 instructions, synthesize speech with local `Piper`, and respond over audio:
-   > *"I am Z Cloud AI Voice Assistant. I am friendly, concise and professional. This is only a Phase 1 technical demo."*
-
-### Running Tests
-
-Execute the automated test suite using `pytest`:
-
+### Control Plane Tests (45 Tests)
 ```bash
-uv run pytest -v
+cd LIVEKIT-AGENT-
+npm run test:isolation      # 6/6 Multi-tenant security & IDOR tests
+npm run test:runtime        # 8/8 M2M agent runtime API tests
+npm run test:call-session    # 8/8 Atomic call persistence & idempotency tests
+npm run test:clinic-tools   # 14/14 Clinic availability & transactional booking tests
+npm run test:phase4         # 9/9 High-concurrency race condition & rule engine tests
 ```
 
-All 11 tests verify configuration defaults, environment variable loading, strict validation of required keys, local STT & TTS capabilities, agent instructions, Silero VAD prewarming, and logging levels.
+**Total Automated Tests: 121 / 121 Passing (100% Success)**
 
-### Docker (Optional for Production)
+---
 
-Docker is **not** required for local development. For production deployments or containerized runs:
+## 🔒 Multi-Tenant Security Model
 
-```bash
-# Build the Docker container
-docker build -t zcloud-ai-telecaller .
-
-# Run container with environment configuration
-docker run --rm --env-file .env zcloud-ai-telecaller
-```
+- **Zero Browser Trust**: All tenant IDs, agent IDs, and ownership checks are validated server-side.
+- **M2M Secret Auth**: Internal APIs require `Authorization: Bearer <WORKER_API_SECRET>`.
+- **Zero Exposed Secrets**: Control Plane runtime endpoints strip all API keys, database credentials, and secrets before responding to workers.
+- **Cross-Tenant Prevention**: Direct IDOR attacks return `404 Not Found` without revealing resource existence.

@@ -72,6 +72,33 @@ class Settings(BaseSettings):
         description="Direct path to Piper .onnx.json config file (optional)",
     )
 
+    # LLM Provider and Local AI settings
+    llm_provider: str = Field(
+        default="gemini",
+        validation_alias="LLM_PROVIDER",
+        description="Active LLM provider: 'gemini', 'ollama', or 'hybrid'",
+    )
+    ollama_base_url: str = Field(
+        default="http://127.0.0.1:11434",
+        validation_alias="OLLAMA_BASE_URL",
+        description="Base URL for local Ollama HTTP API",
+    )
+    ollama_model: str = Field(
+        default="qwen3:4b",
+        validation_alias="OLLAMA_MODEL",
+        description="Local Ollama model identifier (e.g. 'qwen3:4b', 'llama3')",
+    )
+    ollama_timeout: float = Field(
+        default=60.0,
+        validation_alias="OLLAMA_TIMEOUT",
+        description="Timeout in seconds for Ollama inference requests",
+    )
+    ai_mode: str = Field(
+        default="CLOUD_AI",
+        validation_alias="AI_MODE",
+        description="Operating AI mode: 'LOCAL_AI', 'CLOUD_AI', or 'HYBRID'",
+    )
+
     # Agent runtime settings
     agent_name: str = Field(
         default="zcloud-ai-telecaller-agent",
@@ -112,7 +139,7 @@ class Settings(BaseSettings):
         return bool(self.control_plane_url and self.worker_api_secret)
 
     def validate_environment(self) -> None:
-        """Validates that all required environment variables for LiveKit and Gemini LLM are set.
+        """Validates that all required environment variables for the selected AI mode and LiveKit are set.
 
         Raises:
             ValueError: If any required configuration variables are missing or empty.
@@ -124,7 +151,12 @@ class Settings(BaseSettings):
             missing.append("LIVEKIT_API_KEY")
         if not self.livekit_api_secret:
             missing.append("LIVEKIT_API_SECRET")
-        if not self.gemini_api_key:
+
+        is_local_mode = (
+            self.llm_provider.lower() in ("ollama", "local")
+            or self.ai_mode.upper() == "LOCAL_AI"
+        )
+        if not is_local_mode and not self.gemini_api_key:
             missing.append("GEMINI_API_KEY")
 
         if missing:

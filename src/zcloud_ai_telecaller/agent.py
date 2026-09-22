@@ -30,6 +30,7 @@ from livekit.plugins import google, silero
 from zcloud_ai_telecaller.clinic_tools import ClinicToolsManager
 from zcloud_ai_telecaller.config import Settings, get_settings
 from zcloud_ai_telecaller.conversation_state import ConversationStateManager
+from zcloud_ai_telecaller.llm_provider import create_llm_provider
 from zcloud_ai_telecaller.local_stt import FasterWhisperSTT
 from zcloud_ai_telecaller.local_tts import PiperTTS
 from zcloud_ai_telecaller.logging_config import setup_logging
@@ -69,6 +70,11 @@ def create_agent(
 
 def create_agent_session(
     vad: Optional[silero.VAD] = None,
+    llm: Optional[Any] = None,
+    llm_provider: Optional[str] = None,
+    llm_model: Optional[str] = None,
+    llm_base_url: Optional[str] = None,
+    ai_mode: Optional[str] = None,
     gemini_api_key: Optional[str] = None,
     whisper_model_size: str = "base",
     whisper_device: str = "cpu",
@@ -77,8 +83,7 @@ def create_agent_session(
     piper_model_path: Optional[str] = None,
     piper_config_path: Optional[str] = None,
 ) -> AgentSession:
-    """Creates and configures the AgentSession with Silero VAD, local faster-whisper STT, Google Gemini LLM, and local Piper TTS."""
-    # Resolve Gemini API key for Google LLM
+    """Creates and configures the AgentSession with Silero VAD, local faster-whisper STT, LLM provider, and local Piper TTS."""
     effective_gemini_key = (
         gemini_api_key
         or os.environ.get("GEMINI_API_KEY")
@@ -104,13 +109,22 @@ def create_agent_session(
         config_path=piper_config_path,
     )
 
+    # Resolve LLM provider (Ollama, Gemini, or Hybrid)
+    if llm is not None:
+        effective_llm = llm
+    else:
+        effective_llm = create_llm_provider(
+            provider=llm_provider or "gemini",
+            model=llm_model,
+            base_url=llm_base_url,
+            api_key=effective_gemini_key,
+            ai_mode=ai_mode,
+        )
+
     return AgentSession(
         vad=vad_instance,
         stt=stt_stream,
-        llm=google.LLM(
-            model="gemini-2.5-flash",
-            api_key=effective_gemini_key or "dummy-key-for-initialization",
-        ),
+        llm=effective_llm,
         tts=local_piper,
     )
 
@@ -121,6 +135,7 @@ def prewarm(proc: JobProcess) -> None:
     logger.info("Pre-warming Silero VAD model in worker process...")
     proc.userdata["vad"] = silero.VAD.load()
     logger.info("Worker process pre-warm complete")
+
 
 
 async def entrypoint(ctx: JobContext) -> None:
@@ -269,10 +284,38 @@ async def entrypoint(ctx: JobContext) -> None:
     # 4. Retrieve pre-warmed VAD if available, or load fresh
     vad = ctx.proc.userdata.get("vad")
 
-    # 5. Initialize voice pipeline session and agent with resolved configuration & tools
+    # 5. Resolve active LLM provider and initialize voice pipeline session
+    resolved_llm_provider = settings.llm_provider
+    resolved_llm_model = (
+        settings.ollama_model if settings.llm_provider.lower() in ("ollama", "local") else "gemini-2.5-flash"
+    )
+    resolved_llm_base_url = settings.ollama_base_url
+    resolved_ai_mode = settings.ai_mode
+
+    if runtime_config:
+        if runtime_config.llm_provider:
+            resolved_llm_provider = runtime_config.llm_provider
+        if runtime_config.ai_model:
+            resolved_llm_model = runtime_config.ai_model
+        if runtime_config.llm_base_url:
+            resolved_llm_base_url = runtime_config.llm_base_url
+        if runtime_config.ai_mode:
+            resolved_ai_mode = runtime_config.ai_mode
+
+    logger.info(
+        "Voice session LLM provider resolved: provider=%s, model=%s, mode=%s",
+        resolved_llm_provider,
+        resolved_llm_model,
+        resolved_ai_mode,
+    )
+
     try:
         session = create_agent_session(
             vad=vad,
+            llm_provider=resolved_llm_provider,
+            llm_model=resolved_llm_model,
+            llm_base_url=resolved_llm_base_url,
+            ai_mode=resolved_ai_mode,
             gemini_api_key=settings.gemini_api_key,
             whisper_model_size=settings.whisper_model_size,
             whisper_device=settings.whisper_device,
