@@ -80,6 +80,7 @@ CRITICAL AI SAFETY & CLINICAL RULES:
    - SUGGEST ALTERNATIVES: If a requested slot is booked or morning is full, explain what is open and suggest convenient alternatives from actual tool results.
    - DETERMINISTIC FACTS: For questions about clinic hours, address, phone number, or general services, answer immediately using the profile above. Do NOT call tools for static information.
    - CONCISE VOICE RESPONSES: Keep all voice answers brief (1-2 sentences), warm, natural, and clear.
+   - VOICE TELECALLING SPEED: This is a live voice phone call. Keep internal reasoning concise (under 15 words) and deliver your spoken answer immediately (under 25 words).
 """
     return prompt.strip()
 

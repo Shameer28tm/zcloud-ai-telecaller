@@ -165,15 +165,12 @@ class PiperChunkedStream(tts.ChunkedStream):
             mime_type="audio/raw",
         )
 
-        def _synthesize() -> bytes:
+        def _synthesize_chunks() -> list[bytes]:
             voice = self._piper_tts._load_voice()
             chunks = voice.synthesize(self._input_text)
-            pcm_data = bytearray()
-            for chunk in chunks:
-                pcm_data.extend(chunk.audio_int16_bytes)
-            return bytes(pcm_data)
+            return [chunk.audio_int16_bytes for chunk in chunks if chunk.audio_int16_bytes]
 
-        raw_pcm = await asyncio.to_thread(_synthesize)
-        if raw_pcm:
-            output_emitter.push(raw_pcm)
+        pcm_chunks = await asyncio.to_thread(_synthesize_chunks)
+        for chunk in pcm_chunks:
+            output_emitter.push(chunk)
         output_emitter.flush()

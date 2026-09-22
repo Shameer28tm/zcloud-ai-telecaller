@@ -153,9 +153,13 @@ class OllamaLLMStream(LLMStream):
         if tools_def:
             payload["tools"] = tools_def
 
-        # Apply configurable temperature/options if set
-        if self._ollama.temperature is not None:
-            payload["options"] = {"temperature": self._ollama.temperature}
+        # Optimize options for real-time voice telecalling latency
+        options: dict[str, Any] = {
+            "num_ctx": 2048,
+            "temperature": self._ollama.temperature if self._ollama.temperature is not None else 0.4,
+        }
+        payload["options"] = options
+        payload["keep_alive"] = "1h"
 
         timeout = httpx.Timeout(self._ollama.timeout, connect=10.0)
 

@@ -112,7 +112,8 @@ class FasterWhisperSTT(stt.STT):
             segments, info = model.transcribe(
                 audio_stream,
                 language=resolved_lang,
-                beam_size=5,
+                beam_size=1,
+                condition_on_previous_text=False,
             )
             transcription = " ".join(seg.text.strip() for seg in segments).strip()
             detected_language = getattr(info, "language", resolved_lang) or "en"

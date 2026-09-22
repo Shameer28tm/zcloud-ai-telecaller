@@ -126,6 +126,10 @@ def create_agent_session(
         stt=stt_stream,
         llm=effective_llm,
         tts=local_piper,
+        turn_handling={
+            "endpointing": {"min_delay": 0.4, "max_delay": 2.5},
+            "preemptive_generation": {"enabled": True},
+        },
     )
 
 
