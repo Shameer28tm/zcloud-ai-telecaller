@@ -88,6 +88,7 @@ class CallSessionReport(BaseModel):
     room_name: str = Field(validation_alias="roomName", serialization_alias="roomName")
     caller_identity: Optional[str] = Field(default=None, validation_alias="callerIdentity", serialization_alias="callerIdentity")
     caller_number: Optional[str] = Field(default=None, validation_alias="callerNumber", serialization_alias="callerNumber")
+    recipient_number: Optional[str] = Field(default=None, validation_alias="recipientNumber", serialization_alias="recipientNumber")
     caller_name: Optional[str] = Field(default=None, validation_alias="callerName", serialization_alias="callerName")
     direction: str = "INBOUND"
     started_at: Optional[str] = Field(default=None, validation_alias="startedAt", serialization_alias="startedAt")
@@ -115,6 +116,8 @@ class CallSessionAccumulator:
         caller_number: Optional[str] = None,
         caller_name: Optional[str] = None,
         start_time: Optional[float] = None,
+        recipient_number: Optional[str] = None,
+        direction: str = "INBOUND",
     ) -> None:
         self.tenant_id = tenant_id
         self.agent_id = agent_id
@@ -123,6 +126,8 @@ class CallSessionAccumulator:
         self.caller_identity = caller_identity
         self.caller_number = caller_number
         self.caller_name = caller_name
+        self.recipient_number = recipient_number
+        self.direction = direction
         self.start_time = start_time if start_time is not None else time.time()
         self.end_time: Optional[float] = None
         self.end_reason: Optional[str] = None
@@ -254,7 +259,8 @@ class CallSessionAccumulator:
             caller_identity=self.caller_identity,
             caller_number=self.caller_number,
             caller_name=self.caller_name,
-            direction="INBOUND",
+            recipient_number=self.recipient_number,
+            direction=self.direction,
             started_at=started_at,
             ended_at=ended_at,
             duration_seconds=duration_seconds,
@@ -298,6 +304,56 @@ def extract_participant_metadata(metadata_raw: Optional[str]) -> tuple[str, str,
 
     version_str = str(agent_version_id).strip() if agent_version_id else None
     return str(tenant_id).strip(), str(agent_id).strip(), version_str
+
+
+def extract_sip_participant_info(participant: Any) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Extracts (called_number, caller_number, call_id) from a LiveKit SIP participant.
+
+    Inspects participant.attributes (standard LiveKit SIP attributes) and participant identity.
+
+    Returns:
+        tuple[Optional[str], Optional[str], Optional[str]]: (called_number, caller_number, call_id)
+    """
+    called_number = None
+    caller_number = None
+    call_id = None
+
+    attributes = getattr(participant, "attributes", None)
+    if isinstance(attributes, dict):
+        called_number = attributes.get("sip.trunkPhoneNumber") or attributes.get("sip.calledNumber")
+        caller_number = attributes.get("sip.phoneNumber") or attributes.get("sip.callerNumber")
+        call_id = attributes.get("sip.callID") or attributes.get("sip.callId")
+
+    identity = str(getattr(participant, "identity", "") or "")
+    if not caller_number and identity.startswith("sip_"):
+        caller_number = identity[4:]
+
+    return called_number, caller_number, call_id
+
+
+def is_sip_session(participant: Any, room: Optional[Any] = None) -> bool:
+    """Checks whether the session is an inbound telephony SIP call.
+
+    Evaluates participant kind, SIP identity prefixes, attributes, and room name conventions.
+    """
+    kind = getattr(participant, "kind", None)
+    if str(kind).upper() in ("SIP", "PARTICIPANT_KIND_SIP", "4"):
+        return True
+
+    identity = str(getattr(participant, "identity", "") or "").lower()
+    if identity.startswith("sip_"):
+        return True
+
+    attributes = getattr(participant, "attributes", None)
+    if isinstance(attributes, dict) and any(k.startswith("sip.") for k in attributes.keys()):
+        return True
+
+    if room and hasattr(room, "name"):
+        room_name = str(room.name).lower()
+        if room_name.startswith("sip-") or room_name.startswith("sip_"):
+            return True
+
+    return False
 
 
 class RuntimeConfigClient:
@@ -701,3 +757,376 @@ class RuntimeConfigClient:
             raise
         except (aiohttp.ClientError, asyncio.TimeoutError) as net_err:
             raise RuntimeClientConnectionError(f"Failed to reach rescheduling API: {net_err}") from net_err
+
+    async def get_clinic_info(self, tenant_id: str) -> dict[str, Any]:
+        """Retrieves authoritative clinic profile, address, and contact details."""
+        if not tenant_id or not tenant_id.strip():
+            raise RuntimeClientValidationError("tenant_id must be non-empty")
+        if not self.worker_api_secret:
+            raise RuntimeClientAuthError("Worker API secret is not configured")
+
+        url = f"{self.base_url}/api/internal/clinic/info"
+        headers = {
+            "Authorization": f"Bearer {self.worker_api_secret}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        payload = {"tenantId": tenant_id.strip()}
+
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload, headers=headers) as resp:
+                    if resp.status == 200:
+                        body = await resp.json()
+                        return body.get("data", {})
+                    if resp.status == 401:
+                        raise RuntimeClientAuthError("Unauthorized clinic info request")
+                    if resp.status == 404:
+                        raise RuntimeClientNotFoundError(f"Tenant {tenant_id} not found")
+                    body = await resp.json()
+                    raise RuntimeClientValidationError(body.get("error", {}).get("message", "Failed to fetch clinic info"))
+        except (RuntimeClientError,):
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as net_err:
+            raise RuntimeClientConnectionError(f"Failed to reach clinic info API: {net_err}") from net_err
+
+    async def get_services(self, tenant_id: str) -> list[dict[str, Any]]:
+        """Retrieves active clinic services and durations for the tenant."""
+        if not tenant_id or not tenant_id.strip():
+            raise RuntimeClientValidationError("tenant_id must be non-empty")
+        if not self.worker_api_secret:
+            raise RuntimeClientAuthError("Worker API secret is not configured")
+
+        url = f"{self.base_url}/api/internal/clinic/services"
+        headers = {
+            "Authorization": f"Bearer {self.worker_api_secret}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        payload = {"tenantId": tenant_id.strip()}
+
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload, headers=headers) as resp:
+                    if resp.status == 200:
+                        body = await resp.json()
+                        return body.get("data", {}).get("services", [])
+                    if resp.status == 401:
+                        raise RuntimeClientAuthError("Unauthorized services request")
+                    if resp.status == 404:
+                        raise RuntimeClientNotFoundError(f"Tenant {tenant_id} not found")
+                    body = await resp.json()
+                    raise RuntimeClientValidationError(body.get("error", {}).get("message", "Failed to fetch services"))
+        except (RuntimeClientError,):
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as net_err:
+            raise RuntimeClientConnectionError(f"Failed to reach services API: {net_err}") from net_err
+
+    async def get_business_hours(self, tenant_id: str) -> dict[str, Any]:
+        """Retrieves weekly business hours and schedule for the tenant."""
+        if not tenant_id or not tenant_id.strip():
+            raise RuntimeClientValidationError("tenant_id must be non-empty")
+        if not self.worker_api_secret:
+            raise RuntimeClientAuthError("Worker API secret is not configured")
+
+        url = f"{self.base_url}/api/internal/clinic/hours"
+        headers = {
+            "Authorization": f"Bearer {self.worker_api_secret}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        payload = {"tenantId": tenant_id.strip()}
+
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload, headers=headers) as resp:
+                    if resp.status == 200:
+                        body = await resp.json()
+                        return body.get("data", {}).get("schedule", {})
+                    if resp.status == 401:
+                        raise RuntimeClientAuthError("Unauthorized business hours request")
+                    if resp.status == 404:
+                        raise RuntimeClientNotFoundError(f"Tenant {tenant_id} not found")
+                    body = await resp.json()
+                    raise RuntimeClientValidationError(body.get("error", {}).get("message", "Failed to fetch business hours"))
+        except (RuntimeClientError,):
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as net_err:
+            raise RuntimeClientConnectionError(f"Failed to reach business hours API: {net_err}") from net_err
+
+    async def find_customer(
+        self,
+        tenant_id: str,
+        phone: Optional[str] = None,
+        email: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Queries for existing customer by phone or email in tenant-isolated CRM."""
+        if not tenant_id or not tenant_id.strip():
+            raise RuntimeClientValidationError("tenant_id must be non-empty")
+        if not phone and not email:
+            raise RuntimeClientValidationError("Either phone or email must be provided to find customer")
+        if not self.worker_api_secret:
+            raise RuntimeClientAuthError("Worker API secret is not configured")
+
+        url = f"{self.base_url}/api/internal/clinic/customer/find"
+        headers = {
+            "Authorization": f"Bearer {self.worker_api_secret}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        payload: dict[str, Any] = {"tenantId": tenant_id.strip()}
+        if phone:
+            payload["phone"] = phone.strip()
+        if email:
+            payload["email"] = email.strip()
+
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload, headers=headers) as resp:
+                    if resp.status == 200:
+                        body = await resp.json()
+                        return body.get("data", {}).get("customer")
+                    if resp.status == 401:
+                        raise RuntimeClientAuthError("Unauthorized find customer request")
+                    body = await resp.json()
+                    raise RuntimeClientValidationError(body.get("error", {}).get("message", "Find customer error"))
+        except (RuntimeClientError,):
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as net_err:
+            raise RuntimeClientConnectionError(f"Failed to reach find customer API: {net_err}") from net_err
+
+    async def create_customer(
+        self,
+        tenant_id: str,
+        name: str,
+        phone: str,
+        email: Optional[str] = None,
+        notes: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Creates or retrieves a customer record in tenant-isolated CRM with duplicate prevention."""
+        if not tenant_id or not tenant_id.strip():
+            raise RuntimeClientValidationError("tenant_id must be non-empty")
+        if not name or not name.strip():
+            raise RuntimeClientValidationError("name must be non-empty")
+        if not phone or not phone.strip():
+            raise RuntimeClientValidationError("phone must be non-empty")
+        if not self.worker_api_secret:
+            raise RuntimeClientAuthError("Worker API secret is not configured")
+
+        url = f"{self.base_url}/api/internal/clinic/customer/create"
+        headers = {
+            "Authorization": f"Bearer {self.worker_api_secret}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        payload: dict[str, Any] = {
+            "tenantId": tenant_id.strip(),
+            "name": name.strip(),
+            "phone": phone.strip(),
+        }
+        if email:
+            payload["email"] = email.strip()
+        if notes:
+            payload["notes"] = notes.strip()
+
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload, headers=headers) as resp:
+                    if resp.status == 200:
+                        body = await resp.json()
+                        return body.get("data", {})
+                    if resp.status == 401:
+                        raise RuntimeClientAuthError("Unauthorized create customer request")
+                    body = await resp.json()
+                    raise RuntimeClientValidationError(body.get("error", {}).get("message", "Create customer error"))
+        except (RuntimeClientError,):
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as net_err:
+            raise RuntimeClientConnectionError(f"Failed to reach create customer API: {net_err}") from net_err
+
+    async def request_human_transfer(
+        self,
+        tenant_id: str,
+        call_id: Optional[str] = None,
+        reason: Optional[str] = None,
+        caller_number: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Requests human staff transfer and records escalation CallEvent."""
+        if not tenant_id or not tenant_id.strip():
+            raise RuntimeClientValidationError("tenant_id must be non-empty")
+        if not self.worker_api_secret:
+            raise RuntimeClientAuthError("Worker API secret is not configured")
+
+        url = f"{self.base_url}/api/internal/clinic/transfer"
+        headers = {
+            "Authorization": f"Bearer {self.worker_api_secret}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        payload: dict[str, Any] = {"tenantId": tenant_id.strip()}
+        if call_id:
+            payload["callId"] = call_id.strip()
+        if reason:
+            payload["reason"] = reason.strip()
+        if caller_number:
+            payload["callerNumber"] = caller_number.strip()
+
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload, headers=headers) as resp:
+                    if resp.status == 200:
+                        body = await resp.json()
+                        return body.get("data", {})
+                    if resp.status == 401:
+                        raise RuntimeClientAuthError("Unauthorized transfer request")
+                    body = await resp.json()
+                    raise RuntimeClientValidationError(body.get("error", {}).get("message", "Transfer error"))
+        except (RuntimeClientError,):
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as net_err:
+            raise RuntimeClientConnectionError(f"Failed to reach transfer API: {net_err}") from net_err
+
+    async def resolve_sip_inbound(
+        self,
+        called_number: str,
+        caller_number: Optional[str] = None,
+        call_id: Optional[str] = None,
+        sip_trunk_id: Optional[str] = None,
+        room_name: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Resolves inbound SIP call routing authoritatively from the control plane.
+
+        Security:
+            Resolves tenant and agent strictly from the called phone number (DNIS).
+            The caller cannot forge or supply tenantId.
+        """
+        if not called_number or not str(called_number).strip():
+            raise RuntimeClientValidationError("called_number must be non-empty for inbound SIP routing")
+        if not self.worker_api_secret:
+            raise RuntimeClientAuthError("Worker API secret is not configured")
+
+        url = f"{self.base_url}/api/internal/sip/inbound"
+        payload = {
+            "calledNumber": str(called_number).strip(),
+            "callerNumber": str(caller_number).strip() if caller_number else None,
+            "callId": str(call_id).strip() if call_id else None,
+            "sipTrunkId": str(sip_trunk_id).strip() if sip_trunk_id else None,
+            "roomName": str(room_name).strip() if room_name else None,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.worker_api_secret}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload, headers=headers) as resp:
+                    if resp.status == 200:
+                        try:
+                            body = await resp.json()
+                        except Exception as json_err:
+                            raise RuntimeClientConnectionError(
+                                f"Invalid JSON received from control plane: {json_err}"
+                            ) from json_err
+
+                        if not body.get("success") or "data" not in body:
+                            msg = body.get("error", {}).get("message", "Malformed response from control plane")
+                            raise RuntimeClientValidationError(msg)
+
+                        data = body["data"]
+                        if "runtimeConfig" in data and isinstance(data["runtimeConfig"], dict):
+                            data["parsedRuntimeConfig"] = AgentRuntimeConfig.model_validate(data["runtimeConfig"])
+                        return data
+
+                    if resp.status == 401:
+                        raise RuntimeClientAuthError("Control plane rejected worker API secret (401 Unauthorized)")
+
+                    if resp.status == 404:
+                        try:
+                            err_body = await resp.json()
+                            err_msg = err_body.get("error", {}).get("message", "Phone number or agent not found (404)")
+                        except Exception:
+                            err_msg = f"Phone number {called_number} or agent not found (404)"
+                        raise RuntimeClientNotFoundError(err_msg)
+
+                    if resp.status in (400, 402, 403):
+                        try:
+                            err_body = await resp.json()
+                            err_msg = err_body.get("error", {}).get("message", f"Request rejected ({resp.status})")
+                        except Exception:
+                            err_msg = f"Request rejected ({resp.status})"
+                        raise RuntimeClientValidationError(err_msg)
+
+                    raise RuntimeClientConnectionError(
+                        f"Control plane returned unexpected HTTP status {resp.status}"
+                    )
+        except (RuntimeClientError,):
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as net_err:
+            raise RuntimeClientConnectionError(
+                f"Failed to communicate with control plane at {self.base_url}: {net_err}"
+            ) from net_err
+
+    async def update_call_lifecycle(
+        self,
+        call_id: str,
+        status: str,
+        end_reason: Optional[str] = None,
+        duration_seconds: Optional[int] = None,
+        failure_reason: Optional[str] = None,
+        outcome: Optional[str] = None,
+        summary: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Updates the call lifecycle state in the control plane."""
+        if not call_id or not str(call_id).strip():
+            raise RuntimeClientValidationError("call_id must be non-empty")
+        if not self.worker_api_secret:
+            raise RuntimeClientAuthError("Worker API secret is not configured")
+
+        url = f"{self.base_url}/api/internal/sip/lifecycle"
+        payload: dict[str, Any] = {
+            "callId": str(call_id).strip(),
+            "status": str(status).strip(),
+        }
+        if end_reason:
+            payload["endReason"] = end_reason
+        if duration_seconds is not None:
+            payload["durationSeconds"] = duration_seconds
+        if failure_reason:
+            payload["failureReason"] = failure_reason
+        if outcome:
+            payload["outcome"] = outcome
+        if summary:
+            payload["summary"] = summary
+
+        headers = {
+            "Authorization": f"Bearer {self.worker_api_secret}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload, headers=headers) as resp:
+                    if resp.status == 200:
+                        body = await resp.json()
+                        return body.get("data", {})
+                    if resp.status == 401:
+                        raise RuntimeClientAuthError("Control plane rejected worker API secret (401)")
+                    if resp.status == 404:
+                        raise RuntimeClientNotFoundError(f"Call {call_id} not found")
+                    raise RuntimeClientConnectionError(f"Unexpected status {resp.status} from control plane")
+        except (RuntimeClientError,):
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as net_err:
+            raise RuntimeClientConnectionError(f"Failed to update lifecycle: {net_err}") from net_err
+

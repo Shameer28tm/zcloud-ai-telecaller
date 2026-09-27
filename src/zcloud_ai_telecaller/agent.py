@@ -39,6 +39,7 @@ from zcloud_ai_telecaller.prompt_builder import (
     match_deterministic_clinic_query,
 )
 from zcloud_ai_telecaller.rule_engine import BusinessRuleEngine
+from zcloud_ai_telecaller.session import BaseCallSession, BrowserSession, SIPSession
 from zcloud_ai_telecaller.runtime_client import (
     AgentRuntimeConfig,
     CallSessionAccumulator,
@@ -46,6 +47,8 @@ from zcloud_ai_telecaller.runtime_client import (
     CallTranscriptItem,
     RuntimeConfigClient,
     extract_participant_metadata,
+    extract_sip_participant_info,
+    is_sip_session,
 )
 
 AGENT_INSTRUCTIONS = (
@@ -184,6 +187,7 @@ async def entrypoint(ctx: JobContext) -> None:
     rule_engine: Optional[BusinessRuleEngine] = None
     tools_manager: Optional[ClinicToolsManager] = None
     function_tools: list[Any] = []
+    active_call_session: Optional[BaseCallSession] = None
 
     metadata_raw: Optional[str] = None
     part_meta = getattr(participant, "metadata", None)
@@ -202,7 +206,127 @@ async def entrypoint(ctx: JobContext) -> None:
         except Exception as b_err:
             logger.debug("Could not publish livekit data message: %s", b_err)
 
-    if metadata_raw:
+    call_id: Optional[str] = None
+    sip_called_number, sip_caller_number, sip_call_id = extract_sip_participant_info(participant)
+    is_sip = is_sip_session(participant, ctx.room) or bool(sip_called_number)
+
+    if is_sip and sip_called_number:
+        try:
+            logger.info(
+                "Inbound SIP call detected: called_number=%s, caller_number=%s, call_id=%s in room: %s",
+                sip_called_number,
+                sip_caller_number,
+                sip_call_id,
+                ctx.room.name,
+            )
+            client = RuntimeConfigClient(
+                base_url=settings.control_plane_url,
+                worker_api_secret=settings.worker_api_secret,
+            )
+            sip_route = await client.resolve_sip_inbound(
+                called_number=sip_called_number,
+                caller_number=sip_caller_number,
+                call_id=sip_call_id,
+                room_name=ctx.room.name,
+            )
+            tenant_id = sip_route["tenantId"]
+            agent_id = sip_route["agentId"]
+            agent_version_id = sip_route.get("agentVersionId")
+            call_id = sip_route.get("callId")
+            runtime_config = (
+                sip_route.get("parsedRuntimeConfig")
+                or AgentRuntimeConfig.model_validate(sip_route["runtimeConfig"])
+            )
+            logger.info(
+                "Inbound SIP route resolved: tenant_id=%s, agent_id=%s, call_id=%s (agent '%s')",
+                tenant_id,
+                agent_id,
+                call_id,
+                runtime_config.name,
+            )
+
+            # Update call lifecycle to ANSWERED then ACTIVE
+            if call_id:
+                try:
+                    await client.update_call_lifecycle(call_id=call_id, status="ANSWERED")
+                    await client.update_call_lifecycle(call_id=call_id, status="ACTIVE")
+                except Exception as lc_err:
+                    logger.warning("Notice: Could not update call lifecycle for call %s: %s", call_id, lc_err)
+
+            # Build enriched clinic prompt and configure clinic tools
+            if runtime_config.clinic_profile:
+                instructions = build_clinic_system_prompt(runtime_config)
+            else:
+                instructions = runtime_config.prompt
+            greeting = runtime_config.greeting
+            if runtime_config.voice_id:
+                piper_voice = runtime_config.voice_id
+
+            # Initialize structured conversation state and business rule engine
+            max_ctx = 10
+            max_out = 250
+            if runtime_config.business_rules:
+                policy = runtime_config.business_rules.get("conversationPolicy", {})
+                max_ctx = policy.get("maxContextMessages", 10)
+                max_out = policy.get("maxOutputTokens", 250)
+
+            state_manager = ConversationStateManager(
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                max_context_messages=max_ctx,
+                max_output_tokens=max_out,
+            )
+            rule_engine = BusinessRuleEngine(runtime_config.business_rules)
+
+            effective_caller_num = sip_caller_number or sip_route.get("callerNumber")
+            effective_called_num = sip_called_number or sip_route.get("recipientNumber")
+
+            # Initialize authoritative call session accumulator for billing & transcripts
+            accumulator = CallSessionAccumulator(
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                room_name=ctx.room.name,
+                agent_version_id=runtime_config.agent_version_id,
+                caller_identity=participant.identity,
+                caller_number=effective_caller_num,
+                caller_name=getattr(participant, "name", None) or (f"Caller ({effective_caller_num})" if effective_caller_num else participant.identity),
+                recipient_number=effective_called_num,
+                direction="INBOUND",
+            )
+
+            # Initialize backend-controlled clinic tools
+            tools_manager = ClinicToolsManager(
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                call_id=call_id,
+                client=client,
+                transfer_rules=runtime_config.transfer_rules if isinstance(runtime_config.transfer_rules, dict) else {},
+                clinic_profile=runtime_config.clinic_profile or {},
+                state_manager=state_manager,
+                on_event=broadcast_data_packet,
+            )
+            function_tools = tools_manager.get_function_tools()
+            active_call_session = SIPSession(
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                room_name=ctx.room.name,
+                runtime_config=runtime_config,
+                state_manager=state_manager,
+                accumulator=accumulator,
+                called_number=effective_called_num or '',
+                call_id=call_id or '',
+                caller_number=effective_caller_num,
+                sip_call_id=sip_call_id,
+                provider='Plivo',
+                agent_version_id=runtime_config.agent_version_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed to resolve or initialize inbound SIP session: %s. Aborting session.",
+                exc,
+            )
+            return
+    elif metadata_raw:
         try:
             tenant_id, agent_id, agent_version_id = extract_participant_metadata(metadata_raw)
             logger.info(
@@ -272,6 +396,16 @@ async def entrypoint(ctx: JobContext) -> None:
                 on_event=broadcast_data_packet,
             )
             function_tools = tools_manager.get_function_tools()
+            active_call_session = BrowserSession(
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                room_name=ctx.room.name,
+                runtime_config=runtime_config,
+                state_manager=state_manager,
+                accumulator=accumulator,
+                participant_identity=participant.identity,
+                agent_version_id=runtime_config.agent_version_id,
+            )
         except Exception as exc:
             logger.error(
                 "Failed to fetch or apply runtime configuration from control plane: %s. Aborting session.",
@@ -375,6 +509,16 @@ async def entrypoint(ctx: JobContext) -> None:
                 result.get("billableMinutes"),
                 result.get("isDuplicate"),
             )
+            if call_id:
+                try:
+                    await client.update_call_lifecycle(
+                        call_id=call_id,
+                        status="COMPLETED",
+                        duration_seconds=report.duration_seconds,
+                        end_reason=reason,
+                    )
+                except Exception as lc_end_err:
+                    logger.debug("Notice: Call lifecycle update to COMPLETED: %s", lc_end_err)
         except Exception as rep_err:
             logger.error(
                 "Failed to report call session to control plane for room %s: %s",

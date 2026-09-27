@@ -123,6 +123,18 @@ class Settings(BaseSettings):
         description="Internal machine-to-machine worker API secret for control plane authentication",
     )
 
+    # Phase 4 Telephony & LiveKit SIP settings
+    livekit_sip_uri: str = Field(
+        default="sip.livekit.cloud",
+        validation_alias="LIVEKIT_SIP_URI",
+        description="LiveKit SIP URI domain (e.g. sip.livekit.cloud)",
+    )
+    sip_simulation_mode: bool = Field(
+        default=True,
+        validation_alias="SIP_SIMULATION_MODE",
+        description="Run SIP telephony in simulation mode when real provider credentials are not yet provisioned",
+    )
+
     @property
     def is_livekit_configured(self) -> bool:
         """Check if all LiveKit connection credentials are provided."""

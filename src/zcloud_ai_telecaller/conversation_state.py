@@ -34,6 +34,7 @@ class ConversationStateManager:
         self.selected_slot: Optional[str] = None
         self.patient_name: Optional[str] = None
         self.patient_phone: Optional[str] = None
+        self.customer_id: Optional[str] = None
         self.is_awaiting_confirmation: bool = False
         self.appointment_id: Optional[str] = None
         self.booking_confirmed: bool = False
