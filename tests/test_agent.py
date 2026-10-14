@@ -12,7 +12,7 @@ from zcloud_ai_telecaller.agent import (
     prewarm,
 )
 from zcloud_ai_telecaller.local_stt import FasterWhisperSTT
-from zcloud_ai_telecaller.local_tts import PiperTTS
+from zcloud_ai_telecaller.local_tts import AdaptiveBilingualTTS, PiperTTS
 
 
 def test_create_agent():
@@ -47,9 +47,9 @@ async def test_create_agent_session():
     assert isinstance(session.llm, google.LLM)
     assert session.llm.model == "gemini-2.5-flash"
 
-    # Verify local TTS is PiperTTS
-    assert isinstance(session.tts, PiperTTS)
-    assert session.tts.model.startswith("piper-")
+    # Verify local TTS is PiperTTS or AdaptiveBilingualTTS
+    assert isinstance(session.tts, (PiperTTS, AdaptiveBilingualTTS))
+    assert "piper-" in session.tts.model
     assert session.tts.sample_rate == 22050
 
 

@@ -6,7 +6,7 @@ Provides zero-cost local speech recognition compatible with LiveKit Agents.
 import asyncio
 import io
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 from faster_whisper import WhisperModel
 from livekit import rtc
@@ -35,7 +35,8 @@ class FasterWhisperSTT(stt.STT):
         model_size_or_path: str = "base",
         device: str = "auto",
         compute_type: str = "default",
-        language: Optional[str] = "en",
+        language: Optional[str] = None,
+        initial_prompt: Optional[str] = None,
     ) -> None:
         super().__init__(
             capabilities=stt.STTCapabilities(
@@ -47,6 +48,7 @@ class FasterWhisperSTT(stt.STT):
         self._device = device
         self._compute_type = compute_type
         self._language = language
+        self._initial_prompt = initial_prompt
         self._model: Optional[WhisperModel] = None
         self._lock = asyncio.Lock()
 
@@ -109,11 +111,18 @@ class FasterWhisperSTT(stt.STT):
         def _sync_transcribe() -> tuple[str, str]:
             model = self._load_model()
             audio_stream = io.BytesIO(wav_bytes)
+            transcribe_kwargs: dict[str, Any] = {
+                "beam_size": 1,
+                "condition_on_previous_text": False,
+            }
+            if resolved_lang and str(resolved_lang).lower() not in ("auto", "none"):
+                transcribe_kwargs["language"] = resolved_lang
+            if self._initial_prompt:
+                transcribe_kwargs["initial_prompt"] = self._initial_prompt
+
             segments, info = model.transcribe(
                 audio_stream,
-                language=resolved_lang,
-                beam_size=1,
-                condition_on_previous_text=False,
+                **transcribe_kwargs,
             )
             transcription = " ".join(seg.text.strip() for seg in segments).strip()
             detected_language = getattr(info, "language", resolved_lang) or "en"

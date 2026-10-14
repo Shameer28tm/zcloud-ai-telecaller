@@ -32,7 +32,7 @@ from zcloud_ai_telecaller.config import Settings, get_settings
 from zcloud_ai_telecaller.conversation_state import ConversationStateManager
 from zcloud_ai_telecaller.llm_provider import create_llm_provider
 from zcloud_ai_telecaller.local_stt import FasterWhisperSTT
-from zcloud_ai_telecaller.local_tts import PiperTTS
+from zcloud_ai_telecaller.local_tts import AdaptiveBilingualTTS, PiperTTS, SarvamTTS
 from zcloud_ai_telecaller.logging_config import setup_logging
 from zcloud_ai_telecaller.prompt_builder import (
     build_clinic_system_prompt,
@@ -79,14 +79,20 @@ def create_agent_session(
     llm_base_url: Optional[str] = None,
     ai_mode: Optional[str] = None,
     gemini_api_key: Optional[str] = None,
+    use_realtime: Optional[bool] = None,
     whisper_model_size: str = "base",
     whisper_device: str = "cpu",
     whisper_compute_type: str = "int8",
+    whisper_language: Optional[str] = None,
+    whisper_initial_prompt: Optional[str] = None,
     piper_voice: str = "en_US-lessac-medium",
     piper_model_path: Optional[str] = None,
     piper_config_path: Optional[str] = None,
+    sarvam_api_key: Optional[str] = None,
+    sarvam_model: Optional[str] = None,
+    route_thanglish_to_sarvam: bool = False,
 ) -> AgentSession:
-    """Creates and configures the AgentSession with Silero VAD, local faster-whisper STT, LLM provider, and local Piper TTS."""
+    """Creates and configures the AgentSession with Silero VAD, local faster-whisper STT, LLM provider, and adaptive bilingual TTS."""
     effective_gemini_key = (
         gemini_api_key
         or os.environ.get("GEMINI_API_KEY")
@@ -102,14 +108,27 @@ def create_agent_session(
         model_size_or_path=whisper_model_size,
         device=whisper_device,
         compute_type=whisper_compute_type,
+        language=whisper_language,
+        initial_prompt=whisper_initial_prompt,
     )
     stt_stream = stt.StreamAdapter(stt=local_whisper, vad=vad_instance)
 
-    # Local TTS using Piper neural voice
+    # Local TTS using Piper neural voice and optional Sarvam AI Bulbul Indic TTS
     local_piper = PiperTTS(
         voice_name=piper_voice,
         model_path=piper_model_path,
         config_path=piper_config_path,
+    )
+    effective_sarvam_key = sarvam_api_key or os.environ.get("SARVAM_API_KEY")
+    sarvam_instance = (
+        SarvamTTS(api_key=effective_sarvam_key, model=sarvam_model or "bulbul:v4-flash")
+        if effective_sarvam_key
+        else None
+    )
+    bilingual_tts = AdaptiveBilingualTTS(
+        piper_tts=local_piper,
+        sarvam_tts=sarvam_instance,
+        route_thanglish_to_sarvam=route_thanglish_to_sarvam,
     )
 
     # Resolve LLM provider (Ollama, Gemini, or Hybrid)
@@ -122,18 +141,41 @@ def create_agent_session(
             base_url=llm_base_url,
             api_key=effective_gemini_key,
             ai_mode=ai_mode,
+            use_realtime=use_realtime,
         )
 
-    return AgentSession(
-        vad=vad_instance,
-        stt=stt_stream,
-        llm=effective_llm,
-        tts=local_piper,
-        turn_handling={
-            "endpointing": {"min_delay": 0.4, "max_delay": 2.5},
-            "preemptive_generation": {"enabled": True},
-        },
-    )
+    try:
+        from livekit.plugins.google import realtime
+        is_realtime_session = isinstance(effective_llm, realtime.RealtimeModel)
+    except ImportError:
+        is_realtime_session = False
+
+    if is_realtime_session:
+        # Native Gemini Live audio-to-audio:
+        # User audio flows directly to Gemini Live over WebSocket with server-side turn detection.
+        # STT is omitted to eliminate duplicate Whisper CPU transcription and latency.
+        # TTS is provided for programmatic session.say() fallback (greetings and emergency prompts).
+        return AgentSession(
+            vad=vad_instance,
+            llm=effective_llm,
+            tts=bilingual_tts,
+            turn_handling={
+                "endpointing": {"min_delay": 0.25, "max_delay": 1.5},
+                "preemptive_generation": {"enabled": True},
+            },
+        )
+    else:
+        # Cascaded STT -> LLM -> TTS pipeline
+        return AgentSession(
+            vad=vad_instance,
+            stt=stt_stream,
+            llm=effective_llm,
+            tts=bilingual_tts,
+            turn_handling={
+                "endpointing": {"min_delay": 0.35, "max_delay": 2.0},
+                "preemptive_generation": {"enabled": True},
+            },
+        )
 
 
 def prewarm(proc: JobProcess) -> None:
@@ -210,122 +252,168 @@ async def entrypoint(ctx: JobContext) -> None:
     sip_called_number, sip_caller_number, sip_call_id = extract_sip_participant_info(participant)
     is_sip = is_sip_session(participant, ctx.room) or bool(sip_called_number)
 
-    if is_sip and sip_called_number:
-        try:
-            logger.info(
-                "Inbound SIP call detected: called_number=%s, caller_number=%s, call_id=%s in room: %s",
-                sip_called_number,
-                sip_caller_number,
-                sip_call_id,
-                ctx.room.name,
-            )
-            client = RuntimeConfigClient(
-                base_url=settings.control_plane_url,
-                worker_api_secret=settings.worker_api_secret,
-            )
-            sip_route = await client.resolve_sip_inbound(
-                called_number=sip_called_number,
-                caller_number=sip_caller_number,
-                call_id=sip_call_id,
-                room_name=ctx.room.name,
-            )
-            tenant_id = sip_route["tenantId"]
-            agent_id = sip_route["agentId"]
-            agent_version_id = sip_route.get("agentVersionId")
-            call_id = sip_route.get("callId")
-            runtime_config = (
-                sip_route.get("parsedRuntimeConfig")
-                or AgentRuntimeConfig.model_validate(sip_route["runtimeConfig"])
-            )
-            logger.info(
-                "Inbound SIP route resolved: tenant_id=%s, agent_id=%s, call_id=%s (agent '%s')",
-                tenant_id,
-                agent_id,
-                call_id,
-                runtime_config.name,
-            )
+    if is_sip:
+        sip_route_resolved = False
+        if sip_called_number:
+            try:
+                logger.info(
+                    "Inbound SIP call detected: called_number=%s, caller_number=%s, call_id=%s in room: %s",
+                    sip_called_number,
+                    sip_caller_number,
+                    sip_call_id,
+                    ctx.room.name,
+                )
+                client = RuntimeConfigClient(
+                    base_url=settings.control_plane_url,
+                    worker_api_secret=settings.worker_api_secret,
+                )
+                sip_route = await client.resolve_sip_inbound(
+                    called_number=sip_called_number,
+                    caller_number=sip_caller_number,
+                    call_id=sip_call_id,
+                    room_name=ctx.room.name,
+                )
+                tenant_id = sip_route["tenantId"]
+                agent_id = sip_route["agentId"]
+                agent_version_id = sip_route.get("agentVersionId")
+                call_id = sip_route.get("callId")
+                runtime_config = (
+                    sip_route.get("parsedRuntimeConfig")
+                    or AgentRuntimeConfig.model_validate(sip_route["runtimeConfig"])
+                )
+                logger.info(
+                    "Inbound SIP route resolved: tenant_id=%s, agent_id=%s, call_id=%s (agent '%s')",
+                    tenant_id,
+                    agent_id,
+                    call_id,
+                    runtime_config.name,
+                )
 
-            # Update call lifecycle to ANSWERED then ACTIVE
-            if call_id:
-                try:
-                    await client.update_call_lifecycle(call_id=call_id, status="ANSWERED")
-                    await client.update_call_lifecycle(call_id=call_id, status="ACTIVE")
-                except Exception as lc_err:
-                    logger.warning("Notice: Could not update call lifecycle for call %s: %s", call_id, lc_err)
+                # Update call lifecycle to ANSWERED then ACTIVE
+                if call_id:
+                    try:
+                        await client.update_call_lifecycle(call_id=call_id, status="ANSWERED")
+                        await client.update_call_lifecycle(call_id=call_id, status="ACTIVE")
+                    except Exception as lc_err:
+                        logger.warning("Notice: Could not update call lifecycle for call %s: %s", call_id, lc_err)
 
-            # Build enriched clinic prompt and configure clinic tools
-            if runtime_config.clinic_profile:
-                instructions = build_clinic_system_prompt(runtime_config)
-            else:
-                instructions = runtime_config.prompt
-            greeting = runtime_config.greeting
-            if runtime_config.voice_id:
-                piper_voice = runtime_config.voice_id
+                # Build enriched clinic prompt and configure clinic tools
+                if runtime_config.clinic_profile:
+                    instructions = build_clinic_system_prompt(runtime_config)
+                else:
+                    instructions = runtime_config.prompt
+                greeting = runtime_config.greeting
+                if runtime_config.voice_id:
+                    piper_voice = runtime_config.voice_id
 
-            # Initialize structured conversation state and business rule engine
-            max_ctx = 10
-            max_out = 250
-            if runtime_config.business_rules:
-                policy = runtime_config.business_rules.get("conversationPolicy", {})
-                max_ctx = policy.get("maxContextMessages", 10)
-                max_out = policy.get("maxOutputTokens", 250)
+                # Initialize structured conversation state and business rule engine
+                max_ctx = 10
+                max_out = 250
+                if runtime_config.business_rules:
+                    policy = runtime_config.business_rules.get("conversationPolicy", {})
+                    max_ctx = policy.get("maxContextMessages", 10)
+                    max_out = policy.get("maxOutputTokens", 250)
 
-            state_manager = ConversationStateManager(
-                tenant_id=tenant_id,
-                agent_id=agent_id,
-                max_context_messages=max_ctx,
-                max_output_tokens=max_out,
+                state_manager = ConversationStateManager(
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                    max_context_messages=max_ctx,
+                    max_output_tokens=max_out,
+                )
+                rule_engine = BusinessRuleEngine(runtime_config.business_rules)
+
+                effective_caller_num = sip_caller_number or sip_route.get("callerNumber")
+                effective_called_num = sip_called_number or sip_route.get("recipientNumber")
+
+                # Initialize authoritative call session accumulator for billing & transcripts
+                accumulator = CallSessionAccumulator(
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                    room_name=ctx.room.name,
+                    agent_version_id=runtime_config.agent_version_id,
+                    caller_identity=participant.identity,
+                    caller_number=effective_caller_num,
+                    caller_name=getattr(participant, "name", None) or (f"Caller ({effective_caller_num})" if effective_caller_num else participant.identity),
+                    recipient_number=effective_called_num,
+                    direction="INBOUND",
+                )
+
+                # Initialize backend-controlled clinic tools
+                tools_manager = ClinicToolsManager(
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                    call_id=call_id,
+                    client=client,
+                    transfer_rules=runtime_config.transfer_rules if isinstance(runtime_config.transfer_rules, dict) else {},
+                    clinic_profile=runtime_config.clinic_profile or {},
+                    state_manager=state_manager,
+                    on_event=broadcast_data_packet,
+                )
+                function_tools = tools_manager.get_function_tools()
+                active_call_session = SIPSession(
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                    room_name=ctx.room.name,
+                    runtime_config=runtime_config,
+                    state_manager=state_manager,
+                    accumulator=accumulator,
+                    called_number=effective_called_num or '',
+                    call_id=call_id or '',
+                    caller_number=effective_caller_num,
+                    sip_call_id=sip_call_id,
+                    provider='Plivo',
+                    agent_version_id=runtime_config.agent_version_id,
+                )
+                sip_route_resolved = True
+            except Exception as exc:
+                logger.warning(
+                    "Notice: Control plane SIP route resolution failed for number %s: %s. Activating fallback assistant to prevent call disconnect.",
+                    sip_called_number,
+                    exc,
+                )
+
+        if not sip_route_resolved:
+            # Fallback initialization: Keep inbound call alive with default agent instructions & session
+            logger.info("Initializing fallback inbound SIP voice session for participant %s in room %s", participant.identity, ctx.room.name)
+            instructions = AGENT_INSTRUCTIONS
+            greeting = GREETING_MESSAGE
+            effective_caller_num = sip_caller_number or participant.identity
+            effective_called_num = sip_called_number or ""
+
+            fallback_rc = AgentRuntimeConfig(
+                tenantId="default-clinic",
+                agentId="default-agent",
+                agentVersionId="v1",
+                name="Clinic Voice Assistant",
+                prompt=instructions,
+                greeting=greeting,
+                aiModel=settings.gemini_model,
             )
-            rule_engine = BusinessRuleEngine(runtime_config.business_rules)
-
-            effective_caller_num = sip_caller_number or sip_route.get("callerNumber")
-            effective_called_num = sip_called_number or sip_route.get("recipientNumber")
-
-            # Initialize authoritative call session accumulator for billing & transcripts
+            runtime_config = fallback_rc
+            state_manager = ConversationStateManager(tenant_id="default-clinic", agent_id="default-agent")
             accumulator = CallSessionAccumulator(
-                tenant_id=tenant_id,
-                agent_id=agent_id,
+                tenant_id="default-clinic",
+                agent_id="default-agent",
                 room_name=ctx.room.name,
-                agent_version_id=runtime_config.agent_version_id,
                 caller_identity=participant.identity,
                 caller_number=effective_caller_num,
                 caller_name=getattr(participant, "name", None) or (f"Caller ({effective_caller_num})" if effective_caller_num else participant.identity),
                 recipient_number=effective_called_num,
                 direction="INBOUND",
             )
-
-            # Initialize backend-controlled clinic tools
-            tools_manager = ClinicToolsManager(
-                tenant_id=tenant_id,
-                agent_id=agent_id,
-                call_id=call_id,
-                client=client,
-                transfer_rules=runtime_config.transfer_rules if isinstance(runtime_config.transfer_rules, dict) else {},
-                clinic_profile=runtime_config.clinic_profile or {},
-                state_manager=state_manager,
-                on_event=broadcast_data_packet,
-            )
-            function_tools = tools_manager.get_function_tools()
             active_call_session = SIPSession(
-                tenant_id=tenant_id,
-                agent_id=agent_id,
+                tenant_id="default-clinic",
+                agent_id="default-agent",
                 room_name=ctx.room.name,
-                runtime_config=runtime_config,
+                runtime_config=fallback_rc,
                 state_manager=state_manager,
                 accumulator=accumulator,
-                called_number=effective_called_num or '',
-                call_id=call_id or '',
+                called_number=effective_called_num,
+                call_id=call_id or "",
                 caller_number=effective_caller_num,
                 sip_call_id=sip_call_id,
-                provider='Plivo',
-                agent_version_id=runtime_config.agent_version_id,
+                provider="Plivo",
             )
-        except Exception as exc:
-            logger.error(
-                "Failed to resolve or initialize inbound SIP session: %s. Aborting session.",
-                exc,
-            )
-            return
     elif metadata_raw:
         try:
             tenant_id, agent_id, agent_version_id = extract_participant_metadata(metadata_raw)
@@ -425,7 +513,7 @@ async def entrypoint(ctx: JobContext) -> None:
     # 5. Resolve active LLM provider and initialize voice pipeline session
     resolved_llm_provider = settings.llm_provider
     resolved_llm_model = (
-        settings.ollama_model if settings.llm_provider.lower() in ("ollama", "local") else "gemini-2.5-flash"
+        settings.ollama_model if settings.llm_provider.lower() in ("ollama", "local") else settings.gemini_model
     )
     resolved_llm_base_url = settings.ollama_base_url
     resolved_ai_mode = settings.ai_mode
@@ -434,7 +522,10 @@ async def entrypoint(ctx: JobContext) -> None:
         if runtime_config.llm_provider:
             resolved_llm_provider = runtime_config.llm_provider
         if runtime_config.ai_model:
-            resolved_llm_model = runtime_config.ai_model
+            if settings.use_realtime_audio and runtime_config.ai_model == "gemini-2.5-flash":
+                resolved_llm_model = settings.gemini_model
+            else:
+                resolved_llm_model = runtime_config.ai_model
         if runtime_config.llm_base_url:
             resolved_llm_base_url = runtime_config.llm_base_url
         if runtime_config.ai_mode:
@@ -447,6 +538,13 @@ async def entrypoint(ctx: JobContext) -> None:
         resolved_ai_mode,
     )
 
+    byok_creds = runtime_config.byok_credentials if runtime_config else {}
+    lang_settings = runtime_config.language_settings if runtime_config else {}
+
+    effective_gemini_key = byok_creds.get("geminiApiKey") or settings.gemini_api_key
+    effective_sarvam_key = byok_creds.get("sarvamApiKey") or settings.sarvam_api_key
+    route_thanglish = lang_settings.get("routeThanglishToSarvam", False)
+
     try:
         session = create_agent_session(
             vad=vad,
@@ -454,13 +552,19 @@ async def entrypoint(ctx: JobContext) -> None:
             llm_model=resolved_llm_model,
             llm_base_url=resolved_llm_base_url,
             ai_mode=resolved_ai_mode,
-            gemini_api_key=settings.gemini_api_key,
+            gemini_api_key=effective_gemini_key,
             whisper_model_size=settings.whisper_model_size,
             whisper_device=settings.whisper_device,
             whisper_compute_type=settings.whisper_compute_type,
+            whisper_language=settings.whisper_language,
+            whisper_initial_prompt=settings.whisper_initial_prompt,
             piper_voice=piper_voice,
             piper_model_path=settings.piper_model_path,
             piper_config_path=settings.piper_config_path,
+            sarvam_api_key=effective_sarvam_key,
+            sarvam_model=settings.sarvam_model,
+            route_thanglish_to_sarvam=route_thanglish,
+            use_realtime=settings.use_realtime_audio,
         )
         try:
             agent = create_agent(instructions=instructions, tools=function_tools)
@@ -474,7 +578,7 @@ async def entrypoint(ctx: JobContext) -> None:
     reported_lock = asyncio.Lock()
     has_reported = False
 
-    async def finalize_and_report_call(reason: str) -> None:
+    async def finalize_and_report_call(reason: str, status: Optional[str] = None) -> None:
         nonlocal has_reported
         async with reported_lock:
             if has_reported:
@@ -495,12 +599,13 @@ async def entrypoint(ctx: JobContext) -> None:
             except Exception as hist_err:
                 logger.debug("Could not inspect session history: %s", hist_err)
 
-            report = accumulator.finish(reason=reason)
+            report = accumulator.finish(reason=reason, status=status)
             logger.info(
-                "Submitting authoritative call session to control plane: room=%s, duration=%ss, turns=%s",
+                "Submitting authoritative call session to control plane: room=%s, duration=%ss, turns=%s, status=%s",
                 report.room_name,
                 report.duration_seconds,
                 len(report.transcripts),
+                report.status,
             )
             result = await client.report_call_session(report)
             logger.info(
@@ -513,12 +618,12 @@ async def entrypoint(ctx: JobContext) -> None:
                 try:
                     await client.update_call_lifecycle(
                         call_id=call_id,
-                        status="COMPLETED",
+                        status=report.status,
                         duration_seconds=report.duration_seconds,
                         end_reason=reason,
                     )
                 except Exception as lc_end_err:
-                    logger.debug("Notice: Call lifecycle update to COMPLETED: %s", lc_end_err)
+                    logger.debug("Notice: Call lifecycle update to %s: %s", report.status, lc_end_err)
         except Exception as rep_err:
             logger.error(
                 "Failed to report call session to control plane for room %s: %s",
@@ -612,6 +717,20 @@ async def entrypoint(ctx: JobContext) -> None:
         if accumulator:
             accumulator.record_livekit_item(item)
 
+        # Update language preference state from user speech/text
+        if state_manager:
+            try:
+                role = str(getattr(item, "role", "")).lower()
+                if role == "user":
+                    u_text = getattr(item, "text_content", None) or getattr(item, "content", "")
+                    if callable(u_text):
+                        u_text = u_text()
+                    u_text_str = str(u_text).strip()
+                    if u_text_str:
+                        state_manager.update_language_preference_from_input(u_text_str)
+            except Exception as lang_err:
+                logger.debug("Could not extract language preference from item: %s", lang_err)
+
         # Mirror agent verbal speech to live data channel
         try:
             role = str(getattr(item, "role", "")).lower()
@@ -693,11 +812,14 @@ async def entrypoint(ctx: JobContext) -> None:
     def on_session_close(ev) -> None:
         reason = getattr(ev, "reason", "normal")
         err = getattr(ev, "error", None)
-        if err:
-            logger.error("Session ended with error in room %s: %s (reason: %s)", ctx.room.name, err, reason)
+        reason_str = str(reason)
+        is_failure = bool(err) or reason_str in ("realtime_model_error", "error", "failed")
+        if is_failure:
+            logger.error("Session ended with error in room %s: %s (reason: %s)", ctx.room.name, err, reason_str)
+            asyncio.create_task(finalize_and_report_call(reason_str, status="FAILED"))
         else:
-            logger.info("Session ended normally for room %s (reason: %s)", ctx.room.name, reason)
-        asyncio.create_task(finalize_and_report_call(str(reason)))
+            logger.info("Session ended normally for room %s (reason: %s)", ctx.room.name, reason_str)
+            asyncio.create_task(finalize_and_report_call(reason_str, status="COMPLETED"))
 
     async def on_shutdown() -> None:
         await finalize_and_report_call("shutdown")
@@ -707,7 +829,38 @@ async def entrypoint(ctx: JobContext) -> None:
 
     # 7. Start the voice pipeline session
     logger.info("Voice session started for room: %s with participant: %s", ctx.room.name, participant.identity)
-    await session.start(agent, room=ctx.room)
+    try:
+        await session.start(agent, room=ctx.room)
+    except Exception as exc:
+        err_str = str(exc).lower()
+        if "1008" in err_str or "realtime" in err_str or "policy violation" in err_str:
+            logger.warning(
+                "Realtime session startup rejected (%s). Activating robust cascaded STT + Gemini 2.5 Flash + TTS fallback.",
+                exc,
+            )
+            session = create_agent_session(
+                vad=vad,
+                llm_provider="gemini",
+                llm_model="gemini-2.5-flash",
+                llm_base_url=resolved_llm_base_url,
+                ai_mode="CLOUD_AI",
+                gemini_api_key=effective_gemini_key,
+                whisper_model_size=settings.whisper_model_size,
+                whisper_device=settings.whisper_device,
+                whisper_compute_type=settings.whisper_compute_type,
+                whisper_language=settings.whisper_language,
+                whisper_initial_prompt=settings.whisper_initial_prompt,
+                piper_voice=piper_voice,
+                piper_model_path=settings.piper_model_path,
+                piper_config_path=settings.piper_config_path,
+                sarvam_api_key=effective_sarvam_key,
+                sarvam_model=settings.sarvam_model,
+                route_thanglish_to_sarvam=route_thanglish,
+                use_realtime=False,
+            )
+            await session.start(agent, room=ctx.room)
+        else:
+            raise
 
     # 8. Initial voice greeting to caller
     if accumulator:
@@ -716,6 +869,8 @@ async def entrypoint(ctx: JobContext) -> None:
             message=greeting,
             timestamp_offset_ms=0,
         )
+    if state_manager:
+        state_manager.add_message("assistant", greeting, is_greeting=True)
     await broadcast_speech_and_data(greeting)
 
 
@@ -743,6 +898,8 @@ def main() -> None:
     if settings.gemini_api_key:
         os.environ["GEMINI_API_KEY"] = settings.gemini_api_key
         os.environ["GOOGLE_API_KEY"] = settings.gemini_api_key
+    if settings.livekit_agent_deployment:
+        os.environ["LIVEKIT_AGENT_DEPLOYMENT"] = settings.livekit_agent_deployment
 
     cli.run_app(
         WorkerOptions(

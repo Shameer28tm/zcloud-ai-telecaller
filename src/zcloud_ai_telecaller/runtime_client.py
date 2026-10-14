@@ -63,6 +63,8 @@ class AgentRuntimeConfig(BaseModel):
     transfer_rules: Any = Field(default_factory=dict, validation_alias="transferRules")
     clinic_profile: Optional[dict[str, Any]] = Field(default=None, validation_alias="clinicProfile")
     knowledge_base: list[dict[str, Any]] = Field(default_factory=list, validation_alias="knowledgeBase")
+    byok_credentials: dict[str, str] = Field(default_factory=dict, validation_alias="byokCredentials")
+    language_settings: dict[str, Any] = Field(default_factory=dict, validation_alias="languageSettings")
 
 
 class CallTranscriptItem(BaseModel):
@@ -231,16 +233,28 @@ class CallSessionAccumulator:
             confidence=confidence,
         )
 
+    @property
+    def customer_turns(self) -> int:
+        """Returns the number of customer turns recorded."""
+        return sum(1 for t in self.transcripts if t.speaker == "CUSTOMER")
+
     def finish(
         self,
         reason: Optional[str] = None,
-        status: str = "COMPLETED",
+        status: Optional[str] = None,
         end_time: Optional[float] = None,
     ) -> CallSessionReport:
         """Finalizes timestamps and builds the authoritative CallSessionReport."""
         self.end_time = end_time if end_time is not None else time.time()
         self.end_reason = reason or "normal"
-        self.status = status
+        if status:
+            self.status = status
+        elif self.end_reason in ("realtime_model_error", "error", "failed", "crash"):
+            self.status = "FAILED"
+        elif self.customer_turns == 0 and self.end_reason not in ("normal", "shutdown"):
+            self.status = "FAILED"
+        else:
+            self.status = "COMPLETED"
 
         duration_seconds = max(0, int(round(self.end_time - self.start_time)))
 
@@ -320,8 +334,17 @@ def extract_sip_participant_info(participant: Any) -> tuple[Optional[str], Optio
 
     attributes = getattr(participant, "attributes", None)
     if isinstance(attributes, dict):
-        called_number = attributes.get("sip.trunkPhoneNumber") or attributes.get("sip.calledNumber")
-        caller_number = attributes.get("sip.phoneNumber") or attributes.get("sip.callerNumber")
+        called_number = (
+            attributes.get("sip.trunkPhoneNumber")
+            or attributes.get("sip.calledNumber")
+            or attributes.get("sip.to")
+            or attributes.get("sip.dialedNumber")
+        )
+        caller_number = (
+            attributes.get("sip.phoneNumber")
+            or attributes.get("sip.callerNumber")
+            or attributes.get("sip.from")
+        )
         call_id = attributes.get("sip.callID") or attributes.get("sip.callId")
 
     identity = str(getattr(participant, "identity", "") or "")

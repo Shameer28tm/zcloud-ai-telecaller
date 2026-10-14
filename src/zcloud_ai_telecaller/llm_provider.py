@@ -383,6 +383,16 @@ class HybridLLM(FallbackAdapter):
         return "hybrid"
 
 
+VERIFIED_GEMINI_REALTIME_MODELS = frozenset({
+    "gemini-3.8-live",
+    "gemini-2.5-flash-native-audio-preview-12-2025",
+    "gemini-3.1-flash-live-preview",
+    "gemini-3.8-live-extended-thinking",
+})
+DEFAULT_GEMINI_REALTIME_MODEL = "gemini-3.8-live"
+DEFAULT_GEMINI_TEXT_MODEL = "gemini-2.5-flash"
+
+
 def create_llm_provider(
     provider: Optional[str] = None,
     model: Optional[str] = None,
@@ -391,7 +401,8 @@ def create_llm_provider(
     timeout: float = 60.0,
     temperature: Optional[float] = None,
     ai_mode: Optional[str] = None,
-) -> llm.LLM:
+    use_realtime: Optional[bool] = None,
+) -> llm.LLM | Any:
     """Factory creating the appropriate LLM provider based on runtime settings.
 
     Modes supported:
@@ -435,11 +446,45 @@ def create_llm_provider(
 
     # 2. Cloud AI (Gemini)
     if chosen_provider == "gemini":
-        eff_model = model or "gemini-2.5-flash"
+        eff_model = model or (DEFAULT_GEMINI_REALTIME_MODEL if use_realtime else DEFAULT_GEMINI_TEXT_MODEL)
         eff_key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "dummy-key-for-initialization"
-        logger.info("Initializing CLOUD_AI LLM provider: Google Gemini (model=%s)", eff_model)
+
+        if use_realtime is False:
+            is_realtime_requested = False
+        else:
+            is_realtime_requested = (
+                eff_model in VERIFIED_GEMINI_REALTIME_MODELS
+                or eff_model.startswith("gemini-live")
+                or eff_model.endswith("-live")
+                or "native-audio" in eff_model
+                or clean_provider in ("gemini-live", "live", "realtime")
+                or use_realtime is True
+            )
+        if is_realtime_requested:
+            # Ensure model is a verified Gemini Live model; never pass a text model like gemini-2.5-flash to bidiGenerateContent
+            if eff_model in VERIFIED_GEMINI_REALTIME_MODELS or eff_model.startswith("gemini-live") or eff_model.endswith("-live") or "native-audio" in eff_model:
+                realtime_model = eff_model
+            else:
+                realtime_model = DEFAULT_GEMINI_REALTIME_MODEL
+                logger.info(
+                    "Realtime audio requested with model '%s'. Mapping to verified Gemini Live model '%s'.",
+                    eff_model,
+                    realtime_model,
+                )
+
+            logger.info("Initializing CLOUD_AI Gemini Live RealtimeModel (model=%s)", realtime_model)
+            from livekit.plugins.google import realtime
+            return realtime.RealtimeModel(
+                model=realtime_model,
+                api_key=eff_key,
+                temperature=temperature if temperature is not None else 0.5,
+            )
+
+        # Standard text LLM (generateContent) for cascaded STT + LLM + TTS pipeline
+        text_model = eff_model if eff_model not in VERIFIED_GEMINI_REALTIME_MODELS and not eff_model.endswith("-live") else DEFAULT_GEMINI_TEXT_MODEL
+        logger.info("Initializing CLOUD_AI LLM provider: Google Gemini (model=%s)", text_model)
         return google.LLM(
-            model=eff_model,
+            model=text_model,
             api_key=eff_key,
         )
 

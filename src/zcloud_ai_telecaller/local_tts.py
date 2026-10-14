@@ -4,6 +4,7 @@ Provides fast, high-quality, local speech synthesis at ₹0 API cost.
 """
 
 import asyncio
+import io
 import logging
 import os
 import urllib.request
@@ -174,3 +175,178 @@ class PiperChunkedStream(tts.ChunkedStream):
         for chunk in pcm_chunks:
             output_emitter.push(chunk)
         output_emitter.flush()
+
+
+class SarvamTTS(tts.TTS):
+    """Cloud TTS provider utilizing Sarvam AI Bulbul neural voices for Indic languages (including Tamil)."""
+
+    def __init__(
+        self,
+        *,
+        api_key: Optional[str] = None,
+        model: str = "bulbul:v3",
+        language_code: str = "ta-IN",
+        speaker: str = "shreya",
+        sample_rate: int = 22050,
+    ) -> None:
+        super().__init__(
+            capabilities=tts.TTSCapabilities(streaming=False),
+            sample_rate=sample_rate,
+            num_channels=1,
+        )
+        self._api_key = api_key or os.environ.get("SARVAM_API_KEY")
+        self._model = model
+        self._language_code = language_code
+        self._speaker = speaker
+
+    @property
+    def model(self) -> str:
+        return f"sarvam-{self._model}"
+
+    @property
+    def provider(self) -> str:
+        return "sarvam"
+
+    def synthesize(
+        self,
+        text: str,
+        *,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+    ) -> tts.ChunkedStream:
+        return SarvamChunkedStream(tts=self, input_text=text, conn_options=conn_options)
+
+
+class SarvamChunkedStream(tts.ChunkedStream):
+    """Chunked synthesis stream for Sarvam AI Bulbul TTS."""
+
+    def __init__(
+        self,
+        *,
+        tts: SarvamTTS,
+        input_text: str,
+        conn_options: APIConnectOptions,
+    ) -> None:
+        super().__init__(tts=tts, input_text=input_text, conn_options=conn_options)
+        self._sarvam_tts = tts
+
+    async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+        import base64
+        import wave
+        import httpx
+
+        request_id = str(uuid.uuid4())
+        api_key = self._sarvam_tts._api_key
+        if not api_key:
+            raise ValueError("SARVAM_API_KEY is required for SarvamTTS synthesis")
+
+        url = "https://api.sarvam.ai/text-to-speech"
+        headers = {
+            "api-subscription-key": api_key,
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "text": self._input_text,
+            "speaker": self._sarvam_tts._speaker,
+            "model": self._sarvam_tts._model,
+            "language_code": self._sarvam_tts._language_code,
+        }
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+
+        audios = data.get("audios", [])
+        if not audios:
+            output_emitter.flush()
+            return
+
+        wav_bytes = base64.b64decode(audios[0])
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            sample_rate = wf.getframerate()
+            num_channels = wf.getnchannels()
+            pcm_data = wf.readframes(wf.getnframes())
+
+        output_emitter.initialize(
+            request_id=request_id,
+            sample_rate=sample_rate,
+            num_channels=num_channels,
+            mime_type="audio/raw",
+        )
+        output_emitter.push(pcm_data)
+        output_emitter.flush()
+
+
+THANGLISH_MARKERS = {
+    "vanakkam", "ungalluku", "ungalukku", "enna", "venum", "vendum", "sollunga",
+    "nandri", "romba", "ippo", "naalaikku", "nalaikku", "inniku", "epdi", "eppadi",
+    "illai", "aama", "teriyum", "varum", "kudunga", "paakalaam", "irukku", "pannanum",
+    "pannidalam", "paravaallai", "solreenga", "ketkuthu", "sari", "vaanga", "ponga",
+}
+
+
+def is_thanglish_latin(text: str) -> bool:
+    """Checks whether Latin-script text contains recognizable Thanglish conversational tokens."""
+    import re
+    tokens = re.findall(r"\b[a-zA-Z]+\b", text.lower())
+    return any(t in THANGLISH_MARKERS for t in tokens)
+
+
+class AdaptiveBilingualTTS(PiperTTS):
+    """Adaptive TTS router that directs native Tamil Unicode text to Sarvam AI Bulbul (if configured)
+    and English/Thanglish text to local Piper neural TTS. Optionally routes Thanglish to Sarvam.
+    """
+
+    def __init__(
+        self,
+        *,
+        piper_tts: PiperTTS,
+        sarvam_tts: Optional[SarvamTTS] = None,
+        route_thanglish_to_sarvam: bool = False,
+    ) -> None:
+        super().__init__(
+            voice_name=getattr(piper_tts, "_voice_name", DEFAULT_VOICE),
+            model_path=getattr(piper_tts, "_model_path", None),
+            config_path=getattr(piper_tts, "_config_path", None),
+            sample_rate=getattr(piper_tts, "sample_rate", 22050),
+            use_cuda=getattr(piper_tts, "_use_cuda", False),
+        )
+        self._piper_tts = piper_tts
+        self._sarvam_tts = sarvam_tts
+        self.route_thanglish_to_sarvam = route_thanglish_to_sarvam
+
+    @property
+    def model(self) -> str:
+        if self._sarvam_tts and self._sarvam_tts._api_key:
+            return f"adaptive({self._piper_tts.model}+{self._sarvam_tts.model})"
+        return self._piper_tts.model
+
+    @property
+    def provider(self) -> str:
+        return "adaptive-bilingual"
+
+    def prewarm(self) -> None:
+        self._piper_tts.prewarm()
+
+    def synthesize(
+        self,
+        text: str,
+        *,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+    ) -> tts.ChunkedStream:
+        is_tamil = any("\u0b80" <= c <= "\u0bff" for c in text)
+        is_thanglish = self.route_thanglish_to_sarvam and is_thanglish_latin(text)
+        if is_tamil or is_thanglish:
+            if self._sarvam_tts and self._sarvam_tts._api_key:
+                logger.info(
+                    "Routing %s to Sarvam Bulbul TTS",
+                    "Tamil script" if is_tamil else "Thanglish text",
+                )
+                return self._sarvam_tts.synthesize(text, conn_options=conn_options)
+            else:
+                logger.warning(
+                    "Tamil/Thanglish text detected for speech synthesis, but SARVAM_API_KEY is not configured. "
+                    "Piper local TTS will attempt synthesis, but native Tamil pronunciation requires Sarvam Bulbul."
+                )
+        return self._piper_tts.synthesize(text, conn_options=conn_options)
+

@@ -358,3 +358,53 @@ def test_session_abstractions_properties():
     assert sip_sess.sip_call_id == "sip-guid-abc-123"
     assert sip_sess.provider == "Plivo"
     assert sip_sess.call_id == "call-db-id-01"
+
+
+@pytest.mark.asyncio
+async def test_inbound_sip_fallback_when_control_plane_fails(monkeypatch):
+    """Verify that inbound SIP session does not abort on control plane failure and starts fallback session."""
+    from unittest.mock import AsyncMock, MagicMock
+    from zcloud_ai_telecaller import agent
+
+    mock_room = MagicMock()
+    mock_room.name = "sip-clinic-test-call-123"
+
+    mock_job = MagicMock()
+    mock_job.id = "job-sip-123"
+
+    mock_participant = MagicMock()
+    mock_participant.identity = "sip_+919876543210"
+    mock_participant.attributes = {
+        "sip.trunkPhoneNumber": "+918065536028",
+        "sip.phoneNumber": "+919876543210",
+        "sip.callID": "plivo-call-abc",
+    }
+    mock_participant.kind = "SIP"
+
+    mock_ctx = MagicMock()
+    mock_ctx.room = mock_room
+    mock_ctx.job = mock_job
+    mock_ctx.proc = MagicMock()
+    mock_ctx.proc.userdata = {}
+    mock_ctx.connect = AsyncMock()
+    mock_ctx.wait_for_participant = AsyncMock(return_value=mock_participant)
+    mock_ctx.add_shutdown_callback = MagicMock()
+
+    mock_session = MagicMock()
+    mock_session.on = MagicMock(return_value=lambda fn: fn)
+    mock_session.start = AsyncMock()
+    mock_session.say = AsyncMock()
+
+    monkeypatch.setattr(agent, "create_agent_session", lambda **kwargs: mock_session)
+
+    # Force control plane resolution to fail (e.g. 404 or connection error)
+    mock_client = MagicMock()
+    mock_client.resolve_sip_inbound = AsyncMock(side_effect=RuntimeClientNotFoundError("Phone number not found"))
+    monkeypatch.setattr(agent, "RuntimeConfigClient", lambda **kwargs: mock_client)
+
+    await agent.entrypoint(mock_ctx)
+
+    # Verify session was NOT aborted: session.start and session.say were called
+    mock_session.start.assert_awaited_once()
+    mock_session.say.assert_awaited_once_with(agent.GREETING_MESSAGE)
+

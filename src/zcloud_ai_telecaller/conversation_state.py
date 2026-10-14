@@ -38,6 +38,7 @@ class ConversationStateManager:
         self.is_awaiting_confirmation: bool = False
         self.appointment_id: Optional[str] = None
         self.booking_confirmed: bool = False
+        self.preferred_language: str = "en"
 
         # Metrics and lifecycle
         self.start_timestamp: float = time.time()
@@ -45,10 +46,54 @@ class ConversationStateManager:
         self.tool_call_count: int = 0
         self.messages: list[dict[str, str]] = []
 
-    def add_message(self, role: str, content: str) -> None:
+    def set_language_preference(self, lang: str) -> None:
+        """Sets authoritative language preference ('en', 'thanglish', or 'ta')."""
+        if lang in ("en", "thanglish", "ta"):
+            self.preferred_language = lang
+            logger.info("Language preference explicitly updated to '%s'", lang)
+
+    def update_language_preference_from_input(self, user_input: str) -> str:
+        """Inspects user input to detect and persist language preference across turns."""
+        import re
+        raw = (user_input or "").strip()
+        lower = raw.lower()
+
+        # 1. Native Tamil Unicode (U+0B80 to U+0BFF)
+        if any('\u0b80' <= c <= '\u0bff' for c in raw):
+            self.preferred_language = "ta"
+            return "ta"
+
+        # 2. Explicit request to speak Tamil
+        if re.search(r"\b(speak (?:in )?tamil|tamil(?:il|la)? pesu(?:nga)?|tamil please|tamil)\b", lower) and ("speak" in lower or "pesu" in lower):
+            self.preferred_language = "ta"
+            return "ta"
+
+        # 3. Request or switch to English
+        if re.search(r"\b(speak (?:in )?english|in english|english please|switch to english|english(?:il|la)? pesu(?:nga)?)\b", lower):
+            self.preferred_language = "en"
+            return "en"
+
+        # 4. Thanglish conversational markers (Tamil-English mixed speech in Latin letters)
+        thanglish_markers = [
+            "vanakkam", "enakku", "pannanum", "pannunga", "sollunga",
+            "irukka", "venum", "eppo", "enga", "romba", "nandri",
+            "pesuren", "pannidalam", "varalama", "theriyuma"
+        ]
+        if any(re.search(r"\b" + re.escape(marker) + r"\b", lower) for marker in thanglish_markers):
+            self.preferred_language = "thanglish"
+            return "thanglish"
+
+        return self.preferred_language
+
+    def add_message(self, role: str, content: str, is_greeting: bool = False) -> None:
         """Appends a conversation message and enforces bounded context window to minimize LLM token usage."""
+        if role == "user":
+            self.update_language_preference_from_input(content)
+            self.turn_count += 1
+        elif not is_greeting:
+            self.turn_count += 1
+
         self.messages.append({"role": role, "content": content})
-        self.turn_count += 1
 
         # Bounded context window: keep only the most recent N messages
         if len(self.messages) > self.max_context_messages:
@@ -94,6 +139,7 @@ class ConversationStateManager:
         """Provides a compact summary of active state for prompt context injection."""
         return {
             "intent": self.current_intent,
+            "preferredLanguage": self.preferred_language,
             "requestedDate": self.requested_date,
             "selectedSlot": self.selected_slot,
             "availableSlots": self.available_slots[:5],

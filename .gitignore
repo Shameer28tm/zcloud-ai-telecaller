@@ -35,3 +35,7 @@ htmlcov/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Audio test outputs and binary recordings
+test_output_sarvam/
+*.wav

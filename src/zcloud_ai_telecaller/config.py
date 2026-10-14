@@ -30,12 +30,27 @@ class Settings(BaseSettings):
         validation_alias="LIVEKIT_API_SECRET",
         description="LiveKit API Secret",
     )
+    livekit_agent_deployment: str = Field(
+        default="",
+        validation_alias="LIVEKIT_AGENT_DEPLOYMENT",
+        description="LiveKit Agent Deployment environment (e.g. 'production' or '')",
+    )
 
     # Google Gemini API key (for LLM reasoning & responses)
     gemini_api_key: Optional[str] = Field(
         default=None,
         validation_alias="GEMINI_API_KEY",
         description="Google Gemini API Key for LLM plugin",
+    )
+    gemini_model: str = Field(
+        default="gemini-3.8-live",
+        validation_alias="GEMINI_MODEL",
+        description="Google Gemini model identifier (e.g. 'gemini-3.8-live', 'gemini-2.5-flash')",
+    )
+    use_realtime_audio: bool = Field(
+        default=True,
+        validation_alias="USE_REALTIME_AUDIO",
+        description="Enable native real-time audio-to-audio streaming via Gemini Live API",
     )
 
     # Local STT (faster-whisper) settings
@@ -54,8 +69,18 @@ class Settings(BaseSettings):
         validation_alias="WHISPER_COMPUTE_TYPE",
         description="Whisper quantization/compute type (e.g. 'int8', 'float16', 'default')",
     )
+    whisper_language: Optional[str] = Field(
+        default=None,
+        validation_alias="WHISPER_LANGUAGE",
+        description="Whisper language code ('en', 'ta', or None for auto-detect bilingual)",
+    )
+    whisper_initial_prompt: Optional[str] = Field(
+        default="Vanakkam, Tamil, தமிழ், Thanglish clinic appointment booking: dental cleaning, consultation, doctor, receptionist. Enakku appointment book pannanum.",
+        validation_alias="WHISPER_INITIAL_PROMPT",
+        description="Initial prompt for Faster-Whisper to prime bilingual English, Tamil, and Thanglish recognition",
+    )
 
-    # Local TTS (Piper) settings
+    # Local TTS (Piper) and Cloud Indic TTS (Sarvam Bulbul) settings
     piper_voice: str = Field(
         default="en_US-lessac-medium",
         validation_alias="PIPER_VOICE",
@@ -70,6 +95,16 @@ class Settings(BaseSettings):
         default=None,
         validation_alias="PIPER_CONFIG_PATH",
         description="Direct path to Piper .onnx.json config file (optional)",
+    )
+    sarvam_api_key: Optional[str] = Field(
+        default=None,
+        validation_alias="SARVAM_API_KEY",
+        description="Optional API key for Sarvam AI Bulbul Tamil TTS",
+    )
+    sarvam_model: str = Field(
+        default="bulbul:v3",
+        validation_alias="SARVAM_MODEL",
+        description="Sarvam TTS model name (default: bulbul:v3)",
     )
 
     # LLM Provider and Local AI settings
