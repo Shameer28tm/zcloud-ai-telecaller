@@ -632,6 +632,7 @@ class RuntimeConfigClient:
         notes: Optional[str] = None,
         agent_id: Optional[str] = None,
         call_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> dict[str, Any]:
         """Books an appointment in the control plane database with double-booking prevention."""
         if not tenant_id or not tenant_id.strip():
@@ -654,6 +655,8 @@ class RuntimeConfigClient:
             payload["agentId"] = agent_id.strip()
         if call_id:
             payload["callId"] = call_id.strip()
+        if idempotency_key:
+            payload["idempotencyKey"] = idempotency_key.strip()
 
         headers = {
             "Authorization": f"Bearer {self.worker_api_secret}",

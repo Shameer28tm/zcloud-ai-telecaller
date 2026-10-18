@@ -321,6 +321,7 @@ class ClinicToolsManager:
             await self._emit_event(invocation, f"Rejected: {msg}")
             return msg
 
+        idempotency_key = f"{self.call_id or self.tenant_id}_{norm_phone}_{norm_date}_{norm_time}"
         try:
             res = await self.client.book_appointment(
                 tenant_id=self.tenant_id,
@@ -332,6 +333,7 @@ class ClinicToolsManager:
                 time=norm_time,
                 service_name=service,
                 notes=notes,
+                idempotency_key=idempotency_key,
             )
 
             is_existing = res.get("isExisting", False)

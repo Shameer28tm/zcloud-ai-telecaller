@@ -39,7 +39,12 @@ from zcloud_ai_telecaller.prompt_builder import (
     match_deterministic_clinic_query,
 )
 from zcloud_ai_telecaller.rule_engine import BusinessRuleEngine
-from zcloud_ai_telecaller.session import BaseCallSession, BrowserSession, SIPSession
+from zcloud_ai_telecaller.session import (
+    BaseCallSession,
+    BrowserSession,
+    CallSessionState,
+    SIPSession,
+)
 from zcloud_ai_telecaller.runtime_client import (
     AgentRuntimeConfig,
     CallSessionAccumulator,
@@ -364,6 +369,7 @@ async def entrypoint(ctx: JobContext) -> None:
                     provider='Plivo',
                     agent_version_id=runtime_config.agent_version_id,
                 )
+                active_call_session.transition_to(CallSessionState.CONNECTING, "sip_route_resolved")
                 sip_route_resolved = True
             except Exception as exc:
                 logger.warning(
@@ -414,6 +420,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 sip_call_id=sip_call_id,
                 provider="Plivo",
             )
+            active_call_session.transition_to(CallSessionState.CONNECTING, "fallback_sip_initialized")
     elif metadata_raw:
         try:
             tenant_id, agent_id, agent_version_id = extract_participant_metadata(metadata_raw)
@@ -494,6 +501,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 participant_identity=participant.identity,
                 agent_version_id=runtime_config.agent_version_id,
             )
+            active_call_session.transition_to(CallSessionState.CONNECTING, "browser_route_resolved")
         except Exception as exc:
             logger.error(
                 "Failed to fetch or apply runtime configuration from control plane: %s. Aborting session.",
@@ -584,6 +592,16 @@ async def entrypoint(ctx: JobContext) -> None:
             if has_reported:
                 return
             has_reported = True
+
+        if active_call_session:
+            term_state = (
+                CallSessionState.FAILED
+                if (status == "FAILED" or "fail" in reason.lower() or "error" in reason.lower())
+                else CallSessionState.CANCELLED
+                if (status == "CANCELLED" or "cancel" in reason.lower())
+                else CallSessionState.COMPLETED
+            )
+            active_call_session.transition_to(term_state, reason)
 
         if not accumulator or not client:
             return
@@ -863,6 +881,9 @@ async def entrypoint(ctx: JobContext) -> None:
             raise
 
     # 8. Initial voice greeting to caller
+    if active_call_session:
+        active_call_session.transition_to(CallSessionState.ACTIVE, "voice_session_active")
+
     if accumulator:
         accumulator.add_transcript(
             speaker="AGENT",

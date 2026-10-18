@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from enum import Enum
 import logging
+import time
 from typing import Any, Optional
 
 from zcloud_ai_telecaller.runtime_client import (
@@ -12,6 +14,17 @@ from zcloud_ai_telecaller.runtime_client import (
 from zcloud_ai_telecaller.conversation_state import ConversationStateManager
 
 logger = logging.getLogger("zcloud_ai_telecaller.session")
+
+
+class CallSessionState(str, Enum):
+    """Authoritative lifecycle states for an AI voice session."""
+
+    CREATED = "CREATED"
+    CONNECTING = "CONNECTING"
+    ACTIVE = "ACTIVE"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 class BaseCallSession:
@@ -38,6 +51,78 @@ class BaseCallSession:
         self.accumulator = accumulator
         self.agent_version_id = agent_version_id
         self.call_id = call_id
+
+        # Explicit Call Lifecycle State Machine
+        self._state: CallSessionState = CallSessionState.CREATED
+        self.state_transitions: list[dict[str, Any]] = [
+            {
+                "fromState": None,
+                "toState": CallSessionState.CREATED.value,
+                "timestamp": time.time(),
+                "reason": "initialization",
+            }
+        ]
+
+    @property
+    def state(self) -> CallSessionState:
+        """Returns the current authoritative lifecycle state of this call."""
+        return self._state
+
+    @property
+    def is_terminal(self) -> bool:
+        """Returns True if the call has reached a terminal finalization state."""
+        return self._state in (
+            CallSessionState.COMPLETED,
+            CallSessionState.FAILED,
+            CallSessionState.CANCELLED,
+        )
+
+    @property
+    def is_active(self) -> bool:
+        """Returns True if the call is currently in an active conversational turn state."""
+        return self._state == CallSessionState.ACTIVE
+
+    def transition_to(
+        self,
+        new_state: CallSessionState | str,
+        reason: Optional[str] = None,
+    ) -> bool:
+        """Transitions the call to a new lifecycle state with unidirectional validation.
+
+        Terminal states (COMPLETED, FAILED, CANCELLED) cannot transition back to active states.
+        Idempotent: Transitioning to the same state is safe and accepted without error.
+        """
+        target = CallSessionState(new_state) if isinstance(new_state, str) else new_state
+
+        if self._state == target:
+            return True
+
+        # Unidirectional terminal guard: cannot transition out of terminal states
+        if self.is_terminal:
+            logger.warning(
+                "Rejected invalid state transition for call %s: cannot transition from terminal '%s' to '%s'",
+                self.call_id or self.room_name,
+                self._state.value,
+                target.value,
+            )
+            return False
+
+        old_state = self._state
+        self._state = target
+        self.state_transitions.append({
+            "fromState": old_state.value,
+            "toState": target.value,
+            "timestamp": time.time(),
+            "reason": reason or "normal_lifecycle",
+        })
+        logger.info(
+            "CallSession (%s) state transition: %s -> %s (reason: %s)",
+            self.call_id or self.room_name,
+            old_state.value,
+            target.value,
+            reason or "normal_lifecycle",
+        )
+        return True
 
     @property
     def is_telephony(self) -> bool:
