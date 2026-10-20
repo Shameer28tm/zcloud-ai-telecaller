@@ -1156,3 +1156,49 @@ class RuntimeConfigClient:
         except (aiohttp.ClientError, asyncio.TimeoutError) as net_err:
             raise RuntimeClientConnectionError(f"Failed to update lifecycle: {net_err}") from net_err
 
+    async def search_knowledge(
+        self,
+        tenant_id: str,
+        query: str,
+        top_k: int = 3,
+        min_score: float = 0.5,
+    ) -> dict[str, Any]:
+        """Searches tenant knowledge documents and FAQs via Control Plane M2M API."""
+        if not tenant_id or not str(tenant_id).strip():
+            raise RuntimeClientValidationError("tenant_id must be non-empty")
+        if not query or not str(query).strip():
+            raise RuntimeClientValidationError("query must be non-empty")
+        if not self.worker_api_secret:
+            raise RuntimeClientAuthError("Worker API secret is not configured")
+
+        url = f"{self.base_url}/api/internal/knowledge/search"
+        payload = {
+            "tenantId": str(tenant_id).strip(),
+            "query": str(query).strip(),
+            "topK": top_k,
+            "minScore": min_score,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.worker_api_secret}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload, headers=headers) as resp:
+                    if resp.status == 200:
+                        body = await resp.json()
+                        return body.get("data", {})
+                    if resp.status == 401:
+                        raise RuntimeClientAuthError("Control plane rejected worker API secret (401)")
+                    if resp.status == 404:
+                        raise RuntimeClientNotFoundError(f"Tenant {tenant_id} not found")
+                    raise RuntimeClientConnectionError(f"Unexpected status {resp.status} from control plane")
+        except (RuntimeClientError,):
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as net_err:
+            raise RuntimeClientConnectionError(f"Failed to query knowledge base: {net_err}") from net_err
+
+

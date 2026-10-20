@@ -54,6 +54,12 @@ def build_clinic_system_prompt(config: AgentRuntimeConfig) -> str:
             knowledge_entries.append(f"- {t}: {c[:250]}")
     knowledge_str = "\n".join(knowledge_entries) if knowledge_entries else "- Standard clinic policies apply."
 
+    knowledge_guidance = (
+        f"{knowledge_str}\n"
+        "- For detailed questions regarding insurance networks, clinic policies, fees, or medical procedures, "
+        "use the 'search_clinic_knowledge' tool on demand to retrieve verified facts."
+    )
+
     emergency_instruction = profile.get("emergencyInstruction") or (
         "If you are experiencing a life-threatening medical emergency, please hang up immediately "
         "and dial 911 or proceed to the nearest emergency room."
@@ -71,14 +77,15 @@ CLINIC PROFILE:
 - Services Offered: {services_str}
 - Emergency Instruction: {emergency_instruction}
 
-CLINIC KNOWLEDGE & POLICIES:
-{knowledge_str}
+CLINIC KNOWLEDGE & RETRIEVAL:
+{knowledge_guidance}
 
 CRITICAL CLINIC AI OPERATIONAL RULES:
 1. CLINIC ADMINISTRATIVE ASSISTANT: You are the clinic's voice receptionist and administrative assistant. You handle appointment booking, cancellations, rescheduling, clinic hours, service information, and staff transfers.
 2. STRICT NON-CLINICAL ROLE & ZERO MEDICAL ADVICE: You MUST NEVER diagnose illnesses, interpret medical symptoms or lab results, prescribe medications, or advise on clinical treatments. If asked clinical/medical questions, clearly state you cannot provide medical advice and offer to connect the caller with a clinic staff member via request_human_transfer.
 3. MEDICAL EMERGENCY ESCALATION: If the caller mentions severe life-threatening symptoms (chest pain, stroke symptoms, difficulty breathing, severe bleeding, or trauma), recite the clinic's emergency instruction immediately and invoke escalate_medical_emergency.
-4. SAFE FALLBACK & ZERO HALLUCINATION: If asked a question about clinic policies, fees, or medical records not listed above, say: "I do not have that specific information in my system, but our front desk staff can gladly assist you." Never invent or assume facts or availability. Use check_clinic_availability to retrieve real schedule openings.
+4. SAFE FALLBACK & ZERO HALLUCINATION: If asked a question about clinic policies, accepted insurances, fees, or practice rules, call `search_clinic_knowledge` to retrieve verified facts. If no verified evidence is found, say: "I do not have that specific information in my system, but our front desk staff can gladly assist you." Never invent or assume facts or availability. Use check_clinic_availability to retrieve real schedule openings.
+   - For policies and insurance: Use `search_clinic_knowledge` with the caller's specific question.
    - For services, use get_services if the caller wants to know available treatments or pricing.
    - For business hours, use get_business_hours or state the configured hours accurately.
    - For customer lookup, use find_customer when looking up an existing patient's appointment.

@@ -606,9 +606,71 @@ class ClinicToolsManager:
             f"{handoff} For urgent clinical triage, our emergency nurse line is available at {phone}."
         )
 
+    async def search_clinic_knowledge_action(self, query: str) -> str:
+        """Searches authoritative clinic documents and FAQs for grounded answers."""
+        if not self.loop_limiter.acquire():
+            return "I have checked our records. What else can I help you with?"
+
+        clean_query = query.strip()
+        invocation = f"search_clinic_knowledge(query='{clean_query}')"
+        logger.info("Executing backend tool: %s for tenant: %s", invocation, self.tenant_id)
+
+        try:
+            res = await self.client.search_knowledge(
+                tenant_id=self.tenant_id,
+                query=clean_query,
+                top_k=3,
+                min_score=0.45,
+            )
+
+            has_evidence = res.get("hasEvidence", False)
+            results = res.get("results", [])
+
+            if has_evidence and results:
+                top_r = results[0]
+                result_str = f"Found {len(results)} match(es), top score={top_r.get('score')} ({top_r.get('sourceTitle')})"
+                await self._emit_event(invocation, result_str)
+
+                passages_summary = "\n\n".join(
+                    f"[{r.get('sourceTitle')}]: {r.get('content')}" for r in results[:2]
+                )
+                return (
+                    f"<untrusted_clinic_knowledge>\n"
+                    f"{passages_summary}\n"
+                    f"</untrusted_clinic_knowledge>\n"
+                    f"Instruction to agent: State these verified clinic facts directly and concisely to the caller."
+                )
+
+            result_str = "No verified matches found"
+            await self._emit_event(invocation, result_str)
+            return (
+                "I could not verify that specific detail in our clinic knowledge documents. "
+                "I can connect you directly with our front desk receptionist, or help you check our appointment schedule."
+            )
+
+        except Exception as exc:
+            logger.error("Knowledge search tool failed for tenant %s: %s", self.tenant_id, exc)
+            await self._emit_event(invocation, f"Error: {exc}")
+            return (
+                "I am unable to search our clinic policy documents at this moment. "
+                "May I connect you with our front desk receptionist, or check our appointment calendar?"
+            )
+
     def get_function_tools(self) -> list[Any]:
         """Builds LiveKit function tools with strict docstrings and schemas for Gemini LLM."""
         manager = self
+
+        @function_tool
+        async def search_clinic_knowledge(query: str) -> str:
+            """Search the official clinic knowledge base, practice policies, accepted insurance plans, treatment info, doctor credentials, and FAQs.
+
+            Args:
+                query: Specific question or topic to search (e.g. 'accepted insurance', 'root canal duration', 'Saturday hours').
+
+            Returns:
+                Verified facts from clinic documents or guidance if not verified.
+            """
+            return await manager.search_clinic_knowledge_action(query=query)
 
         @function_tool
         async def get_clinic_info() -> str:
@@ -768,6 +830,7 @@ class ClinicToolsManager:
             return await manager.escalate_emergency_action(symptoms_or_reason=symptoms_or_reason)
 
         return [
+            search_clinic_knowledge,
             get_clinic_info,
             get_services,
             get_business_hours,
