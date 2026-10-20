@@ -18,11 +18,14 @@ from typing import Optional
 
 from zcloud_ai_telecaller.rag.embeddings.hybrid_provider import HybridEmbeddingProvider
 from zcloud_ai_telecaller.rag.types import RetrievalResponse, RetrievalResult
-from zcloud_ai_telecaller.rag.vector_store import PersistentTenantVectorStore
+from zcloud_ai_telecaller.rag.vector_store import (
+    PersistentTenantVectorStore,
+    are_embedding_models_compatible,
+)
 
 logger = logging.getLogger("zcloud_ai_telecaller.rag.retriever")
 
-DEFAULT_MIN_RELEVANCE_SCORE = 0.65
+DEFAULT_MIN_RELEVANCE_SCORE = 0.50
 DEFAULT_TOP_K = 3
 
 
@@ -97,13 +100,43 @@ class TenantKnowledgeRetriever:
             # 1. Generate query vector using hybrid embedding provider
             query_vec, provider_used, fallback_triggered = self.embedding_provider.embed_query_with_fallback(clean_query)
 
-            # 2. Search tenant vector store
+            # Determine query model to enforce vector space compatibility
+            if fallback_triggered and getattr(self.embedding_provider, "cloud_provider", None):
+                active_model = self.embedding_provider.cloud_provider.model_name
+            else:
+                active_model = getattr(self.embedding_provider, "model_name", None)
+
+            # 2. Search tenant vector store strictly within compatible vector space
             results = self.vector_store.search(
                 tenant_id=tenant_id,
                 query_vector=query_vec,
                 top_k=effective_k,
                 min_score=effective_min_score,
+                query_model_name=active_model,
             )
+
+            # If fallback model is incompatible with indexed chunks, return controlled guidance
+            if fallback_triggered and not results:
+                raw_records = self.vector_store._load_tenant_index(tenant_id)
+                if any(
+                    r.get("embeddingModel") and not are_embedding_models_compatible(r.get("embeddingModel"), active_model)
+                    for r in raw_records
+                ):
+                    logger.warning(
+                        "Cloud fallback model %s is incompatible with local index model for tenant %s. Returning controlled unavailable state.",
+                        active_model,
+                        tenant_id,
+                    )
+                    return RetrievalResponse(
+                        tenant_id=tenant_id,
+                        query=query,
+                        results=[],
+                        has_sufficient_evidence=False,
+                        top_score=0.0,
+                        retrieval_latency_ms=(time.perf_counter() - t0) * 1000.0,
+                        context_text="",
+                        grounding_guidance="Clinic knowledge records are temporarily operating under a model transition. Please confirm with clinic reception.",
+                    )
 
             latency_ms = (time.perf_counter() - t0) * 1000.0
             if latency_ms > self.latency_budget_ms:

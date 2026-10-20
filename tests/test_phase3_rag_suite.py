@@ -522,3 +522,51 @@ async def test_clinic_tools_search_knowledge_in_function_tools_list():
     assert "search_clinic_knowledge" in tool_names
     assert "book_clinic_appointment" in tool_names
     assert "check_clinic_availability" in tool_names
+
+
+def test_retriever_blocks_incompatible_vector_space_search(tmp_path):
+    """Verify retriever does not search an index with incompatible vector spaces."""
+    store = PersistentTenantVectorStore(storage_dir=str(tmp_path))
+    # Index document with BGE local model
+    chunk = KnowledgeChunk(
+        id="c-compat",
+        tenant_id="tenant-compat",
+        document_id="doc-compat",
+        chunk_index=0,
+        content="Apex Dental offers root canal treatment.",
+        clean_content="Apex Dental offers root canal treatment.",
+        char_length=40,
+        metadata=KnowledgeChunkMetadata(
+            document_id="doc-compat",
+            tenant_id="tenant-compat",
+            source_title="Policies",
+        ),
+    )
+    store.upsert_chunks("tenant-compat", "doc-compat", [chunk], [[0.1] * 384], "BAAI/bge-small-en-v1.5")
+
+    # Local provider fails, triggering fallback to cloud model
+    mock_local = MagicMock(spec=BaseEmbeddingProvider)
+    mock_local.model_name = "BAAI/bge-small-en-v1.5"
+    mock_local.dimension = 384
+    mock_local.embed_query.side_effect = RuntimeError("Local engine out of memory")
+
+    mock_cloud = MagicMock(spec=BaseEmbeddingProvider)
+    mock_cloud.provider_name = "gemini_cloud"
+    mock_cloud.model_name = "gemini-embedding-001"
+    mock_cloud.dimension = 384
+    mock_cloud.embed_query.return_value = [0.2] * 384
+
+    hybrid = HybridEmbeddingProvider(
+        local_provider=mock_local,
+        cloud_provider=mock_cloud,
+        allow_cloud_fallback=True,
+    )
+
+    retriever = TenantKnowledgeRetriever(vector_store=store, embedding_provider=hybrid)
+    resp = retriever.search("tenant-compat", "root canal")
+
+    # Vector space guard must block searching BGE index with Gemini vector
+    assert resp.has_sufficient_evidence is False
+    assert len(resp.results) == 0
+    assert "model transition" in resp.grounding_guidance.lower()
+

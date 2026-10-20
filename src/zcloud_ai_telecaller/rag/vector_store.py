@@ -43,6 +43,24 @@ def cosine_similarity(v1: list[float], v2: list[float]) -> float:
     return max(0.0, min(1.0, dot_product / (math.sqrt(norm_a) * math.sqrt(norm_b))))
 
 
+def are_embedding_models_compatible(m1: Optional[str], m2: Optional[str]) -> bool:
+    """Checks whether two embedding model names belong to the same vector space.
+
+    Guarantees:
+    - Dissimilar model architectures (e.g. BAAI/bge-small vs Google/gemini-embedding) are incompatible.
+    - Variations of the same model name (e.g., 'BAAI/bge-small-en-v1.5' vs 'bge-small-en-v1.5') are compatible.
+    """
+    if not m1 or not m2:
+        return True
+    n1 = m1.strip().lower().replace("models/", "").replace("baai/", "")
+    n2 = m2.strip().lower().replace("models/", "").replace("baai/", "")
+    if n1 == n2:
+        return True
+    if "bge-small" in n1 and "bge-small" in n2:
+        return True
+    return False
+
+
 class PersistentTenantVectorStore:
     """Authoritative vector repository partitioned strictly per tenant."""
 
@@ -60,8 +78,15 @@ class PersistentTenantVectorStore:
 
     def _get_tenant_file(self, tenant_id: str) -> Path:
         """Returns safe path for tenant vector index file."""
+        if not tenant_id or not isinstance(tenant_id, str):
+            raise ValueError(f"Invalid tenant_id: {tenant_id!r}")
         safe_tenant = "".join(c for c in tenant_id if c.isalnum() or c in ("-", "_"))
-        return self.storage_dir / f"tenant_{safe_tenant}_index.json"
+        if not safe_tenant:
+            raise ValueError(f"Tenant ID must contain alphanumeric characters: {tenant_id!r}")
+        file_path = (self.storage_dir / f"tenant_{safe_tenant}_index.json").resolve()
+        if not str(file_path).startswith(str(self.storage_dir.resolve())):
+            raise ValueError(f"Path traversal detected in tenant_id: {tenant_id!r}")
+        return file_path
 
     def _load_tenant_index(self, tenant_id: str) -> list[dict[str, Any]]:
         """Loads tenant index from disk into cache."""
@@ -157,11 +182,13 @@ class PersistentTenantVectorStore:
         query_vector: list[float],
         top_k: int = 3,
         min_score: float = 0.65,
+        query_model_name: Optional[str] = None,
     ) -> list[RetrievalResult]:
         """Performs tenant-isolated vector search using cosine similarity.
 
         Guarantees:
         - Only records belonging to `tenant_id` are examined.
+        - Vector space compatibility: chunks indexed under an incompatible embedding model are ignored.
         - Results below `min_score` are filtered out.
         - Near-duplicate passages are de-duplicated.
         """
@@ -172,6 +199,17 @@ class PersistentTenantVectorStore:
 
             scored: list[tuple[float, dict[str, Any]]] = []
             for r in records:
+                doc_model = r.get("embeddingModel")
+                # Vector compatibility check: never calculate similarity across incompatible embedding models
+                if query_model_name and doc_model and not are_embedding_models_compatible(doc_model, query_model_name):
+                    logger.debug(
+                        "Skipping chunk %s: indexed with model %s, queried with incompatible model %s",
+                        r.get("chunkId"),
+                        doc_model,
+                        query_model_name,
+                    )
+                    continue
+
                 doc_vec = r.get("vector")
                 if not doc_vec:
                     continue
